@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: scriptwriting
+      POSTGRES_USER: scriptwriting
+      POSTGRES_PASSWORD: scriptwriting
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scriptwriting -d scriptwriting"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    environment:
+      APP_DATABASE_URL: postgresql+psycopg://scriptwriting:scriptwriting@db:5432/scriptwriting
+      APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-true}
+      APP_AUTO_CREATE_SCHEMA: "false"
+      APP_BOOTSTRAP_SECRET: ${APP_BOOTSTRAP_SECRET:-change-this-setup-secret}
+      APP_BOOTSTRAP_ADMIN_USERNAME: ${APP_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      APP_BOOTSTRAP_ADMIN_PASSWORD: ${APP_BOOTSTRAP_ADMIN_PASSWORD:-change-this-before-start}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
