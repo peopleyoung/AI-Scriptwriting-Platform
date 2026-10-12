@@ -9,18 +9,25 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.db import Base, build_engine, build_session_factory, get_db
-from app.models import AuditLog, SessionRecord, User
+from app.models import AuditLog, SessionRecord, User, Work, WorkMember
 from app.schemas import (
     AuditResponse,
     BootstrapRequest,
     ChangePasswordRequest,
     CreateUserRequest,
     HealthResponse,
+    InviteMemberRequest,
     LoginRequest,
     LoginResponse,
+    MemberRoleRequest,
     ResetPasswordRequest,
     SetActiveRequest,
+    TransferOwnershipRequest,
     UserResponse,
+    WorkCreateRequest,
+    WorkDetailResponse,
+    WorkMemberResponse,
+    WorkResponse,
 )
 from app.security import hash_password, new_session_token, session_expiry, session_token_hash, verify_password
 
@@ -56,6 +63,76 @@ def _get_user_by_id(db: Session, user_id: str) -> User:
     if user is None:
         raise _error("USER_NOT_FOUND", "user not found", status.HTTP_404_NOT_FOUND)
     return user
+
+
+def _get_work(db: Session, work_id: str) -> Work:
+    work = db.get(Work, work_id)
+    if work is None:
+        raise _error("WORK_NOT_FOUND", "work not found", status.HTTP_404_NOT_FOUND)
+    return work
+
+
+def _resolve_user_target(db: Session, user_id: str | None, username: str | None) -> User:
+    target = _find_user(db, username) if username else db.get(User, user_id)
+    if target is None:
+        raise _error("USER_NOT_FOUND", "user not found", status.HTTP_404_NOT_FOUND)
+    return target
+
+
+def _require_work_member(
+    db: Session,
+    user: User,
+    work_id: str,
+    roles: set[str] | None = None,
+    *,
+    allow_trashed: bool = False,
+) -> tuple[Work, WorkMember]:
+    work = _get_work(db, work_id)
+    if work.status == "TRASHED" and not allow_trashed:
+        raise _error("WORK_NOT_FOUND", "work not found", status.HTTP_404_NOT_FOUND)
+    member = db.scalar(
+        select(WorkMember).where(
+            WorkMember.work_id == work.id,
+            WorkMember.user_id == user.id,
+            WorkMember.status == "ACCEPTED",
+        )
+    )
+    if member is None or (roles is not None and member.role not in roles):
+        raise _error("WORK_ACCESS_DENIED", "work access is not allowed", status.HTTP_403_FORBIDDEN)
+    if roles is not None and "OWNER" in roles and work.owner_id != user.id:
+        raise _error("WORK_ACCESS_DENIED", "work access is not allowed", status.HTTP_403_FORBIDDEN)
+    return work, member
+
+
+def _work_response(work: Work) -> WorkResponse:
+    return WorkResponse(
+        id=work.id,
+        title=work.title,
+        owner_id=work.owner_id,
+        status=work.status,
+        revision=work.revision,
+        created_at=work.created_at,
+        updated_at=work.updated_at,
+    )
+
+
+def _member_response(member: WorkMember) -> WorkMemberResponse:
+    return WorkMemberResponse(
+        id=member.id,
+        work_id=member.work_id,
+        user_id=member.user_id,
+        username=member.user.username,
+        role=member.role,
+        status=member.status,
+        invited_at=member.invited_at,
+        accepted_at=member.accepted_at,
+        revoked_at=member.revoked_at,
+    )
+
+
+def _work_detail_response(work: Work, member: WorkMember) -> WorkDetailResponse:
+    members = work.members if member.role == "OWNER" else [item for item in work.members if item.status == "ACCEPTED"]
+    return WorkDetailResponse(**_work_response(work).model_dump(), members=[_member_response(item) for item in members])
 
 
 def _cookie_options(settings: Settings) -> dict:
@@ -181,6 +258,275 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.execute(text("SELECT 1"))
         return HealthResponse(status="ok")
 
+    @app.post("/api/v1/works", response_model=WorkResponse, status_code=status.HTTP_201_CREATED)
+    def create_work(
+        payload: WorkCreateRequest,
+        user: Annotated[User, Depends(active_user)],
+        request: Request,
+        db: Annotated[Session, Depends(get_db)],
+    ) -> WorkResponse:
+        _check_csrf(request)
+        now = datetime.now(timezone.utc)
+        work = Work(title=payload.title, owner_id=user.id)
+        db.add(work)
+        db.flush()
+        db.add(
+            WorkMember(
+                work_id=work.id,
+                user_id=user.id,
+                role="OWNER",
+                status="ACCEPTED",
+                accepted_at=now,
+            )
+        )
+        _audit(db, "WORK_CREATED", actor=user, metadata={"work_id": work.id})
+        db.commit()
+        return _work_response(work)
+
+    @app.get("/api/v1/works", response_model=list[WorkResponse])
+    def list_works(user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> list[WorkResponse]:
+        works = db.scalars(
+            select(Work)
+            .join(WorkMember, WorkMember.work_id == Work.id)
+            .where(
+                WorkMember.user_id == user.id,
+                WorkMember.status == "ACCEPTED",
+                Work.status == "ACTIVE",
+            )
+            .order_by(Work.created_at)
+        ).all()
+        return [_work_response(work) for work in works]
+
+    @app.get("/api/v1/works/{work_id}", response_model=WorkDetailResponse)
+    def get_work(work_id: str, user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> WorkDetailResponse:
+        work, member = _require_work_member(db, user, work_id)
+        return _work_detail_response(work, member)
+
+    @app.post("/api/v1/works/{work_id}/members/invitations", response_model=WorkMemberResponse, status_code=status.HTTP_201_CREATED)
+    def invite_member(
+        work_id: str,
+        payload: InviteMemberRequest,
+        request: Request,
+        owner: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> WorkMemberResponse:
+        _check_csrf(request)
+        work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        target = _resolve_user_target(db, payload.user_id, payload.username)
+        if not target.is_active:
+            raise _error("ACCOUNT_DISABLED", "account is disabled", status.HTTP_409_CONFLICT)
+        if target.id == owner.id:
+            raise _error("MEMBER_ALREADY_EXISTS", "the owner is already a member", status.HTTP_409_CONFLICT)
+        member = db.scalar(select(WorkMember).where(WorkMember.work_id == work.id, WorkMember.user_id == target.id))
+        if member is not None and member.status == "ACCEPTED":
+            raise _error("MEMBER_ALREADY_EXISTS", "user is already a member", status.HTTP_409_CONFLICT)
+        if member is not None and member.status == "PENDING":
+            raise _error("INVITATION_ALREADY_PENDING", "an invitation is already pending", status.HTTP_409_CONFLICT)
+        now = datetime.now(timezone.utc)
+        if member is None:
+            member = WorkMember(work_id=work.id, user_id=target.id)
+            db.add(member)
+        member.role = payload.role
+        member.status = "PENDING"
+        member.invited_by_user_id = owner.id
+        member.invited_at = now
+        member.accepted_at = None
+        member.revoked_at = None
+        db.flush()
+        _audit(
+            db,
+            "WORK_MEMBER_INVITED",
+            actor=owner,
+            target=target,
+            metadata={"work_id": work.id, "member_id": member.id, "role": member.role},
+        )
+        db.commit()
+        return _member_response(member)
+
+    def _accept_member_invitation(work_id: str, user: User, db: Session, request: Request, member_user_id: str | None = None) -> WorkMemberResponse:
+        _check_csrf(request)
+        work = _get_work(db, work_id)
+        if work.status == "TRASHED":
+            raise _error("WORK_NOT_FOUND", "work not found", status.HTTP_404_NOT_FOUND)
+        if member_user_id is not None and member_user_id != user.id:
+            raise _error("WORK_ACCESS_DENIED", "only the invited user can accept the invitation", status.HTTP_403_FORBIDDEN)
+        member = db.scalar(
+            select(WorkMember).where(
+                WorkMember.work_id == work.id,
+                WorkMember.user_id == user.id,
+                WorkMember.status == "PENDING",
+            )
+        )
+        if member is None:
+            raise _error("INVITATION_NOT_FOUND", "pending invitation not found", status.HTTP_404_NOT_FOUND)
+        member.status = "ACCEPTED"
+        member.accepted_at = datetime.now(timezone.utc)
+        member.revoked_at = None
+        _audit(
+            db,
+            "WORK_MEMBER_ACCEPTED",
+            actor=user,
+            target=user,
+            metadata={"work_id": work.id, "member_id": member.id, "role": member.role},
+        )
+        db.commit()
+        return _member_response(member)
+
+    @app.post("/api/v1/works/{work_id}/members/accept", response_model=WorkMemberResponse)
+    def accept_member_invitation(
+        work_id: str,
+        request: Request,
+        user: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> WorkMemberResponse:
+        return _accept_member_invitation(work_id, user, db, request)
+
+    @app.post("/api/v1/works/{work_id}/members/{member_user_id}/accept", response_model=WorkMemberResponse)
+    def accept_member_invitation_for_user(
+        work_id: str,
+        member_user_id: str,
+        request: Request,
+        user: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> WorkMemberResponse:
+        return _accept_member_invitation(work_id, user, db, request, member_user_id)
+
+    @app.post("/api/v1/works/{work_id}/members/{member_user_id}/revoke", response_model=WorkMemberResponse)
+    def revoke_member(
+        work_id: str,
+        member_user_id: str,
+        request: Request,
+        owner: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> WorkMemberResponse:
+        _check_csrf(request)
+        work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        member = db.scalar(select(WorkMember).where(WorkMember.work_id == work.id, WorkMember.user_id == member_user_id))
+        if member is None or member.role == "OWNER":
+            raise _error("MEMBER_NOT_FOUND", "member not found", status.HTTP_404_NOT_FOUND)
+        if member.status == "REVOKED":
+            raise _error("MEMBER_NOT_FOUND", "member not found", status.HTTP_404_NOT_FOUND)
+        member.status = "REVOKED"
+        member.revoked_at = datetime.now(timezone.utc)
+        _audit(
+            db,
+            "WORK_MEMBER_REVOKED",
+            actor=owner,
+            target=member.user,
+            metadata={"work_id": work.id, "member_id": member.id},
+        )
+        db.commit()
+        return _member_response(member)
+
+    @app.patch("/api/v1/works/{work_id}/members/{member_user_id}", response_model=WorkMemberResponse)
+    def change_member_role(
+        work_id: str,
+        member_user_id: str,
+        payload: MemberRoleRequest,
+        request: Request,
+        owner: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> WorkMemberResponse:
+        _check_csrf(request)
+        work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        member = db.scalar(
+            select(WorkMember).where(
+                WorkMember.work_id == work.id,
+                WorkMember.user_id == member_user_id,
+                WorkMember.status.in_(["ACCEPTED", "PENDING"]),
+            )
+        )
+        if member is None or member.role == "OWNER":
+            raise _error("MEMBER_NOT_FOUND", "member not found", status.HTTP_404_NOT_FOUND)
+        old_role = member.role
+        member.role = payload.role
+        _audit(
+            db,
+            "WORK_MEMBER_ROLE_CHANGED",
+            actor=owner,
+            target=member.user,
+            metadata={"work_id": work.id, "member_id": member.id, "from_role": old_role, "to_role": member.role},
+        )
+        db.commit()
+        return _member_response(member)
+
+    @app.post("/api/v1/works/{work_id}/transfer-ownership", response_model=WorkResponse)
+    def transfer_ownership(
+        work_id: str,
+        payload: TransferOwnershipRequest,
+        request: Request,
+        owner: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> WorkResponse:
+        _check_csrf(request)
+        work, owner_member = _require_work_member(db, owner, work_id, {"OWNER"})
+        target = _resolve_user_target(db, payload.user_id, payload.username)
+        if not target.is_active:
+            raise _error("ACCOUNT_DISABLED", "account is disabled", status.HTTP_409_CONFLICT)
+        target_member = db.scalar(
+            select(WorkMember).where(
+                WorkMember.work_id == work.id,
+                WorkMember.user_id == target.id,
+                WorkMember.status == "ACCEPTED",
+            )
+        )
+        if target_member is None or target_member.role == "OWNER":
+            raise _error("OWNERSHIP_TARGET_INVALID", "ownership can only transfer to an active member", status.HTTP_409_CONFLICT)
+        now = datetime.now(timezone.utc)
+        work.owner_id = target.id
+        work.updated_at = now
+        owner_member.role = "EDITOR"
+        target_member.role = "OWNER"
+        _audit(
+            db,
+            "WORK_OWNERSHIP_TRANSFERRED",
+            actor=owner,
+            target=target,
+            metadata={"work_id": work.id, "from_user_id": owner.id, "to_user_id": target.id},
+        )
+        db.commit()
+        return _work_response(work)
+
+    @app.post("/api/v1/works/{work_id}/trash", response_model=WorkResponse)
+    def trash_work(
+        work_id: str,
+        request: Request,
+        owner: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> WorkResponse:
+        _check_csrf(request)
+        work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        if work.status == "TRASHED":
+            raise _error("WORK_ALREADY_TRASHED", "work is already in the trash", status.HTTP_409_CONFLICT)
+        now = datetime.now(timezone.utc)
+        work.status = "TRASHED"
+        work.trashed_at = now
+        work.updated_at = now
+        work.revision += 1
+        _audit(db, "WORK_TRASHED", actor=owner, metadata={"work_id": work.id})
+        db.commit()
+        return _work_response(work)
+
+    @app.post("/api/v1/works/{work_id}/restore", response_model=WorkResponse)
+    def restore_work(
+        work_id: str,
+        request: Request,
+        owner: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> WorkResponse:
+        _check_csrf(request)
+        work, _ = _require_work_member(db, owner, work_id, {"OWNER"}, allow_trashed=True)
+        if work.status != "TRASHED":
+            raise _error("WORK_NOT_TRASHED", "work is not in the trash", status.HTTP_409_CONFLICT)
+        now = datetime.now(timezone.utc)
+        work.status = "ACTIVE"
+        work.trashed_at = None
+        work.updated_at = now
+        work.revision += 1
+        _audit(db, "WORK_RESTORED", actor=owner, metadata={"work_id": work.id})
+        db.commit()
+        return _work_response(work)
+
     @app.post("/api/v1/auth/login", response_model=LoginResponse)
     @app.post("/api/v1/login", response_model=LoginResponse, include_in_schema=False)
     def login(payload: LoginRequest, request: Request, response: Response, db: Annotated[Session, Depends(get_db)]) -> LoginResponse:
@@ -285,6 +631,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         target = _get_user_by_id(db, user_id)
         if target.id == actor.id and not payload.active:
             raise _error("SELF_DISABLE_FORBIDDEN", "an administrator cannot disable their own account", status.HTTP_400_BAD_REQUEST)
+        if not payload.active and db.scalar(select(Work.id).where(Work.owner_id == target.id).limit(1)) is not None:
+            raise _error("OWNER_TRANSFER_REQUIRED", "transfer work ownership before disabling this account", status.HTTP_409_CONFLICT)
         if target.role == "ADMIN" and not payload.active:
             active_admins = db.scalars(select(User.id).where(User.role == "ADMIN", User.is_active.is_(True))).all()
             if len(active_admins) <= 1:
