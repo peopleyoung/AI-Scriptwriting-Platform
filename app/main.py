@@ -1,19 +1,33 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Annotated
+from copy import deepcopy
+from typing import Any, Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response, status
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.db import Base, build_engine, build_session_factory, get_db
-from app.models import AuditLog, SessionRecord, User, Work, WorkMember
+from app.models import (
+    AuditLog,
+    ChangeProposal,
+    ScriptTemplate,
+    ScriptTemplateVersion,
+    SessionRecord,
+    User,
+    Work,
+    WorkCreativeData,
+    WorkMember,
+)
+from app.features import invalidate_work_external_state, register_feature_routes
 from app.schemas import (
     AuditResponse,
     BootstrapRequest,
     ChangePasswordRequest,
+    ChangeProposalRequest,
+    ChangeProposalResponse,
     CreateUserRequest,
     HealthResponse,
     InviteMemberRequest,
@@ -23,6 +37,11 @@ from app.schemas import (
     ResetPasswordRequest,
     SetActiveRequest,
     TransferOwnershipRequest,
+    CreativeResponse,
+    TemplateCreateRequest,
+    TemplateResponse,
+    TemplateUpdateRequest,
+    TemplateVersionResponse,
     UserResponse,
     WorkCreateRequest,
     WorkDetailResponse,
@@ -34,6 +53,325 @@ from app.security import hash_password, new_session_token, session_expiry, sessi
 
 _failed_logins: dict[tuple[str, str], list[datetime]] = {}
 
+_CREATIVE_STAGES = ("brief", "characters", "outline")
+
+
+def _builtin_template_definitions() -> list[dict[str, Any]]:
+    common_settings = {
+        "episode_count": {"type": "integer", "min": 1, "max": 200},
+        "episode_duration_minutes": {"type": "integer", "min": 1, "max": 120},
+        "episode_word_target": {"type": "integer", "min": 1, "max": 100000},
+        "genre_tags": {"type": "array", "items": {"type": "string", "max_length": 64}},
+        "output_format": {"type": "enum", "values": ["markdown", "docx"]},
+    }
+    return [
+        {
+            "slug": "vertical-micro-drama",
+            "name": "竖屏微短剧",
+            "definition": {
+                "settings": common_settings,
+                "creative_brief": {
+                    "fields": {
+                        "theme": {"type": "string", "max_length": 2000},
+                        "tone": {"type": "string", "max_length": 2000},
+                        "logline": {"type": "string", "max_length": 2000},
+                        "target_audience": {"type": "string", "max_length": 500},
+                        "world_setting": {"type": "string", "max_length": 4000},
+                    }
+                },
+                "characters": {
+                    "item_fields": {
+                        "name": {"type": "string", "max_length": 100, "required": True},
+                        "role": {"type": "string", "max_length": 200},
+                        "traits": {"type": "string", "max_length": 1000},
+                        "goal": {"type": "string", "max_length": 1000},
+                        "relationship": {"type": "string", "max_length": 1000},
+                    }
+                },
+                "outline": {
+                    "fields": {
+                        "premise": {"type": "string", "max_length": 4000},
+                        "beginning": {"type": "string", "max_length": 4000},
+                        "middle": {"type": "string", "max_length": 4000},
+                        "ending": {"type": "string", "max_length": 4000},
+                        "episode_summaries": {"type": "array", "items": {"type": "string", "max_length": 4000}},
+                    }
+                },
+                "script_structure": {"blocks": ["SCENE_HEADING", "ACTION", "CHARACTER", "DIALOGUE"]},
+                "output_formats": ["markdown", "docx"],
+            },
+        },
+        {
+            "slug": "web-short-drama",
+            "name": "网剧短剧",
+            "definition": {
+                "settings": common_settings,
+                "creative_brief": {
+                    "fields": {
+                        "theme": {"type": "string", "max_length": 2000},
+                        "tone": {"type": "string", "max_length": 2000},
+                        "logline": {"type": "string", "max_length": 2000},
+                        "target_audience": {"type": "string", "max_length": 500},
+                        "world_setting": {"type": "string", "max_length": 4000},
+                    }
+                },
+                "characters": {
+                    "item_fields": {
+                        "name": {"type": "string", "max_length": 100, "required": True},
+                        "role": {"type": "string", "max_length": 200},
+                        "traits": {"type": "string", "max_length": 1000},
+                        "goal": {"type": "string", "max_length": 1000},
+                        "relationship": {"type": "string", "max_length": 1000},
+                    }
+                },
+                "outline": {
+                    "fields": {
+                        "premise": {"type": "string", "max_length": 4000},
+                        "beginning": {"type": "string", "max_length": 4000},
+                        "middle": {"type": "string", "max_length": 4000},
+                        "ending": {"type": "string", "max_length": 4000},
+                        "episode_summaries": {"type": "array", "items": {"type": "string", "max_length": 4000}},
+                    }
+                },
+                "script_structure": {"blocks": ["SCENE_HEADING", "ACTION", "CHARACTER", "DIALOGUE"]},
+                "output_formats": ["markdown", "docx"],
+            },
+        },
+    ]
+
+
+def _definition_fields(definition: dict[str, Any], section: str) -> dict[str, Any]:
+    aliases = {
+        "settings": ("settings", "settings_schema", "settings_fields", "work_settings"),
+        "brief": ("creative_brief", "creative_brief_fields", "brief_fields"),
+        "characters": ("characters", "character_fields"),
+        "outline": ("outline", "outline_fields"),
+    }
+    value = next((definition[key] for key in aliases[section] if key in definition), {})
+    if isinstance(value, list):
+        fields: dict[str, Any] = {}
+        for field in value:
+            if isinstance(field, str):
+                fields[field] = {"type": "string"}
+            elif isinstance(field, dict) and isinstance(field.get("key", field.get("name")), str):
+                key = field.get("key", field.get("name"))
+                fields[key] = {name: item for name, item in field.items() if name not in {"key", "name"}}
+            else:
+                raise _error("INVALID_TEMPLATE_DEFINITION", f"{section} contains an invalid field definition", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        return fields
+    if not isinstance(value, dict):
+        return {}
+    if section == "characters":
+        value = value.get("item_fields", value.get("fields", value))
+    elif "fields" in value and isinstance(value["fields"], dict):
+        value = value["fields"]
+    if isinstance(value, list):
+        fields: dict[str, Any] = {}
+        for field in value:
+            if isinstance(field, str):
+                fields[field] = {"type": "string"}
+            elif isinstance(field, dict) and isinstance(field.get("key", field.get("name")), str):
+                key = field.get("key", field.get("name"))
+                fields[key] = {name: item for name, item in field.items() if name not in {"key", "name"}}
+            else:
+                raise _error("INVALID_TEMPLATE_DEFINITION", f"{section} contains an invalid field definition", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        value = fields
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key, rule in value.items():
+        result[key] = {"type": rule} if isinstance(rule, str) else (rule if isinstance(rule, dict) else {"type": "string"})
+    return result
+
+
+def _validate_value(value: Any, rule: Any, path: str) -> None:
+    if isinstance(rule, str):
+        rule = {"type": rule}
+    if not isinstance(rule, dict):
+        rule = {"type": "string"}
+    kind = rule.get("type", "string")
+    minimum = rule.get("min", rule.get("minimum"))
+    maximum = rule.get("max", rule.get("maximum"))
+    if kind in {"string", "text"}:
+        if not isinstance(value, str):
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} must be a string", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        max_length = rule.get("max_length", rule.get("maxLength"))
+        if max_length is not None and len(value) > max_length:
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} is too long", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    elif kind == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} must be an integer", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if minimum is not None and value < minimum:
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} is below the minimum", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if maximum is not None and value > maximum:
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} is above the maximum", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    elif kind == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} must be numeric", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if minimum is not None and value < minimum:
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} is below the minimum", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if maximum is not None and value > maximum:
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} is above the maximum", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    elif kind in {"boolean", "bool"} and not isinstance(value, bool):
+        raise _error("INVALID_TEMPLATE_VALUE", f"{path} must be a boolean", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    elif kind in {"array", "list"}:
+        if not isinstance(value, list):
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} must be a list", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        min_items = rule.get("min_items", rule.get("minItems"))
+        if min_items is not None and len(value) < min_items:
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} has too few items", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        for index, item in enumerate(value):
+            if "items" in rule:
+                _validate_value(item, rule["items"], f"{path}[{index}]")
+    elif kind in {"object", "dict"}:
+        fields = rule.get("fields", rule.get("properties", {}))
+        _validate_object(value, fields if isinstance(fields, dict) else {}, path)
+    elif kind == "enum":
+        if value not in rule.get("values", []):
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path} is not an allowed value", status.HTTP_422_UNPROCESSABLE_CONTENT)
+
+
+def _validate_object(value: Any, fields: dict[str, Any], path: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _error("INVALID_TEMPLATE_VALUE", f"{path} must be an object", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    unknown = set(value) - set(fields)
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise _error("INVALID_TEMPLATE_FIELD", f"{path} contains unsupported fields: {names}", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    for name, rule in fields.items():
+        if isinstance(rule, dict) and rule.get("required") and name not in value:
+            raise _error("INVALID_TEMPLATE_VALUE", f"{path}.{name} is required", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if name in value:
+            _validate_value(value[name], rule, f"{path}.{name}")
+    return value
+
+
+def _validate_settings(template_version: ScriptTemplateVersion | None, settings: dict[str, Any]) -> dict[str, Any]:
+    if template_version is None:
+        raise _error("TEMPLATE_REQUIRED", "the work has no template snapshot", status.HTTP_409_CONFLICT)
+    return _validate_object(settings, _definition_fields(template_version.definition_json, "settings"), "settings")
+
+
+def _validate_template_definition(definition: dict[str, Any]) -> None:
+    required_sections = ("settings", "brief", "characters", "outline")
+    missing = [section for section in required_sections if not _definition_fields(definition, section)]
+    structure = next((definition[key] for key in ("script_structure", "script_blocks", "body_structure") if key in definition), None)
+    if missing or not structure:
+        raise _error(
+            "INVALID_TEMPLATE_DEFINITION",
+            "template must define settings, creative brief, characters, outline, and script structure",
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+    formats = next((definition[key] for key in ("output_formats", "output_format", "formats") if key in definition), None)
+    if not formats:
+        raise _error(
+            "INVALID_TEMPLATE_DEFINITION",
+            "template must define output formats",
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
+def _validate_creative(template_version: ScriptTemplateVersion | None, stage: str, content: Any) -> Any:
+    if stage not in _CREATIVE_STAGES:
+        raise _error("INVALID_STAGE", "creative stage is invalid", status.HTTP_422_UNPROCESSABLE_CONTENT)
+    if template_version is None:
+        raise _error("TEMPLATE_REQUIRED", "the work has no template snapshot", status.HTTP_409_CONFLICT)
+    fields = _definition_fields(template_version.definition_json, stage)
+    if stage == "characters":
+        if not isinstance(content, list):
+            raise _error("INVALID_TEMPLATE_VALUE", "characters must be a list", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        return [_validate_object(item, fields, f"characters[{index}]") for index, item in enumerate(content)]
+    return _validate_object(content, fields, stage)
+
+
+def _published_template_version(db: Session, template_id: str | None = None, version_id: str | None = None) -> ScriptTemplateVersion:
+    if version_id:
+        version = db.get(ScriptTemplateVersion, version_id)
+        if version is None or version.status != "PUBLISHED":
+            raise _error("TEMPLATE_NOT_FOUND", "published template version not found", status.HTTP_404_NOT_FOUND)
+        if template_id and version.template_id != template_id:
+            raise _error("TEMPLATE_VERSION_MISMATCH", "template and template version do not match", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        return version
+    query = select(ScriptTemplateVersion).join(ScriptTemplate).where(ScriptTemplateVersion.status == "PUBLISHED")
+    if template_id:
+        query = query.where(ScriptTemplateVersion.template_id == template_id)
+    else:
+        query = query.where(ScriptTemplate.slug == "vertical-micro-drama")
+    version = db.scalars(query.order_by(ScriptTemplateVersion.version.desc(), ScriptTemplateVersion.created_at.desc())).first()
+    if version is None:
+        raise _error("TEMPLATE_NOT_FOUND", "published template not found", status.HTTP_404_NOT_FOUND)
+    return version
+
+
+def _template_version_response(version: ScriptTemplateVersion) -> TemplateVersionResponse:
+    return TemplateVersionResponse(
+        id=version.id,
+        template_id=version.template_id,
+        version=version.version,
+        status=version.status,
+        definition=version.definition_json,
+        created_at=version.created_at,
+        published_at=version.published_at,
+    )
+
+
+def _template_response(template: ScriptTemplate, include_versions: bool = False) -> TemplateResponse:
+    published = next((version for version in reversed(template.versions) if version.status == "PUBLISHED"), None)
+    return TemplateResponse(
+        id=template.id,
+        slug=template.slug,
+        name=template.name,
+        status="PUBLISHED" if published else "DRAFT",
+        created_at=template.created_at,
+        updated_at=template.updated_at,
+        published_version=_template_version_response(published) if published else None,
+        versions=[_template_version_response(version) for version in template.versions] if include_versions else [],
+    )
+
+
+def _creative_data(work: Work) -> WorkCreativeData:
+    if work.creative_data is None:
+        work.creative_data = WorkCreativeData(work_id=work.id)
+    return work.creative_data
+
+
+def _stage_revision(data: WorkCreativeData, stage: str) -> int:
+    return getattr(data, f"{stage}_revision")
+
+
+def _set_stage(data: WorkCreativeData, stage: str, content: Any, *, confirmed: bool = False) -> None:
+    setattr(data, f"{stage}_json", deepcopy(content))
+    if confirmed:
+        setattr(data, f"{stage}_confirmed_json", deepcopy(content))
+
+
+def _creative_response(work: Work) -> CreativeResponse:
+    data = _creative_data(work)
+    return CreativeResponse(
+        work_id=work.id,
+        brief=data.brief_json,
+        characters=data.characters_json,
+        outline=data.outline_json,
+        confirmed={stage: getattr(data, f"{stage}_confirmed_json") for stage in _CREATIVE_STAGES},
+        revisions={stage: _stage_revision(data, stage) for stage in _CREATIVE_STAGES},
+    )
+
+
+def _proposal_response(proposal: ChangeProposal) -> ChangeProposalResponse:
+    return ChangeProposalResponse(
+        id=proposal.id,
+        work_id=proposal.work_id,
+        stage=proposal.stage,
+        content=proposal.content_json,
+        base_revision=proposal.base_revision,
+        status=proposal.status,
+        submitted_by_user_id=proposal.submitted_by_user_id,
+        reviewed_by_user_id=proposal.reviewed_by_user_id,
+        rejection_reason=proposal.rejection_reason,
+        created_at=proposal.created_at,
+        reviewed_at=proposal.reviewed_at,
+    )
+
 
 def _audit(db: Session, event_type: str, actor: User | None = None, target: User | None = None, metadata: dict | None = None) -> None:
     db.add(
@@ -44,6 +382,26 @@ def _audit(db: Session, event_type: str, actor: User | None = None, target: User
             metadata_json=metadata or {},
         )
     )
+
+
+def _ensure_builtin_templates(db: Session) -> None:
+    for builtin in _builtin_template_definitions():
+        template = db.scalar(select(ScriptTemplate).where(ScriptTemplate.slug == builtin["slug"]))
+        if template is not None:
+            continue
+        template = ScriptTemplate(slug=builtin["slug"], name=builtin["name"], status="ACTIVE")
+        db.add(template)
+        db.flush()
+        db.add(
+            ScriptTemplateVersion(
+                template_id=template.id,
+                version=1,
+                status="PUBLISHED",
+                definition_json=builtin["definition"],
+                published_at=datetime.now(timezone.utc),
+            )
+        )
+    db.commit()
 
 
 def _public_user(user: User) -> UserResponse:
@@ -99,7 +457,7 @@ def _require_work_member(
     )
     if member is None or (roles is not None and member.role not in roles):
         raise _error("WORK_ACCESS_DENIED", "work access is not allowed", status.HTTP_403_FORBIDDEN)
-    if roles is not None and "OWNER" in roles and work.owner_id != user.id:
+    if roles == {"OWNER"} and work.owner_id != user.id:
         raise _error("WORK_ACCESS_DENIED", "work access is not allowed", status.HTTP_403_FORBIDDEN)
     return work, member
 
@@ -111,6 +469,8 @@ def _work_response(work: Work) -> WorkResponse:
         owner_id=work.owner_id,
         status=work.status,
         revision=work.revision,
+        template_version_id=work.template_version_id,
+        settings=work.settings_json or {},
         created_at=work.created_at,
         updated_at=work.updated_at,
     )
@@ -227,6 +587,8 @@ async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
     if settings.auto_create_schema and settings.environment != "production":
         Base.metadata.create_all(bind=app.state.engine)
+    with app.state.session_factory() as db:
+        _ensure_builtin_templates(db)
     if settings.bootstrap_admin_username and settings.bootstrap_admin_password:
         with app.state.session_factory() as db:
             if db.scalar(select(User).where(User.role == "ADMIN")) is None:
@@ -258,6 +620,105 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.execute(text("SELECT 1"))
         return HealthResponse(status="ok")
 
+    @app.get("/api/v1/templates", response_model=list[TemplateResponse])
+    def list_published_templates(_: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> list[TemplateResponse]:
+        templates = db.scalars(select(ScriptTemplate).order_by(ScriptTemplate.created_at)).all()
+        return [_template_response(template) for template in templates if any(version.status == "PUBLISHED" for version in template.versions)]
+
+    @app.get("/api/v1/templates/{template_id}", response_model=TemplateResponse)
+    def get_published_template(template_id: str, _: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> TemplateResponse:
+        template = db.get(ScriptTemplate, template_id)
+        if template is None or not any(version.status == "PUBLISHED" for version in template.versions):
+            raise _error("TEMPLATE_NOT_FOUND", "template not found", status.HTTP_404_NOT_FOUND)
+        return _template_response(template)
+
+    @app.post("/api/v1/admin/templates", response_model=TemplateResponse, status_code=status.HTTP_201_CREATED)
+    def create_template(
+        payload: TemplateCreateRequest,
+        actor: Annotated[User, Depends(admin_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> TemplateResponse:
+        _validate_template_definition(payload.definition)
+        template = ScriptTemplate(slug=payload.slug or payload.key or "", name=payload.name, created_by_user_id=actor.id)
+        db.add(template)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            raise _error("TEMPLATE_SLUG_TAKEN", "template slug is already in use", status.HTTP_409_CONFLICT)
+        db.add(
+            ScriptTemplateVersion(
+                template_id=template.id,
+                version=1,
+                status="DRAFT",
+                definition_json=payload.definition,
+                created_by_user_id=actor.id,
+            )
+        )
+        _audit(db, "SCRIPT_TEMPLATE_CREATED", actor=actor, metadata={"template_id": template.id, "slug": template.slug})
+        db.commit()
+        return _template_response(template, include_versions=True)
+
+    @app.get("/api/v1/admin/templates", response_model=list[TemplateResponse])
+    def list_admin_templates(_: Annotated[User, Depends(admin_user)], db: Annotated[Session, Depends(get_db)]) -> list[TemplateResponse]:
+        return [_template_response(template, include_versions=True) for template in db.scalars(select(ScriptTemplate).order_by(ScriptTemplate.created_at)).all()]
+
+    @app.patch("/api/v1/admin/templates/{template_id}", response_model=TemplateResponse)
+    def update_template(
+        template_id: str,
+        payload: TemplateUpdateRequest,
+        actor: Annotated[User, Depends(admin_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> TemplateResponse:
+        template = db.get(ScriptTemplate, template_id)
+        if template is None:
+            raise _error("TEMPLATE_NOT_FOUND", "template not found", status.HTTP_404_NOT_FOUND)
+        latest = max(template.versions, key=lambda version: version.version, default=None)
+        if latest is None:
+            raise _error("TEMPLATE_VERSION_NOT_FOUND", "template version not found", status.HTTP_404_NOT_FOUND)
+        if latest.status == "DRAFT":
+            draft = latest
+        else:
+            draft = ScriptTemplateVersion(
+                template_id=template.id,
+                version=latest.version + 1,
+                status="DRAFT",
+                definition_json=deepcopy(latest.definition_json),
+                created_by_user_id=actor.id,
+            )
+            db.add(draft)
+        if payload.name is not None:
+            template.name = payload.name
+        if payload.definition is not None:
+            draft.definition_json = {**(draft.definition_json or {}), **payload.definition}
+        _validate_template_definition(draft.definition_json)
+        _audit(db, "SCRIPT_TEMPLATE_UPDATED", actor=actor, metadata={"template_id": template.id, "version": draft.version})
+        db.commit()
+        return _template_response(template, include_versions=True)
+
+    @app.post("/api/v1/admin/templates/{template_id}/publish", response_model=TemplateVersionResponse)
+    def publish_template(
+        template_id: str,
+        actor: Annotated[User, Depends(admin_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> TemplateVersionResponse:
+        template = db.get(ScriptTemplate, template_id)
+        if template is None:
+            raise _error("TEMPLATE_NOT_FOUND", "template not found", status.HTTP_404_NOT_FOUND)
+        draft = max((version for version in template.versions if version.status == "DRAFT"), key=lambda version: version.version, default=None)
+        if draft is None:
+            raise _error("TEMPLATE_ALREADY_PUBLISHED", "there is no draft template version to publish", status.HTTP_409_CONFLICT)
+        _validate_template_definition(draft.definition_json)
+        for version in template.versions:
+            if version.status == "PUBLISHED":
+                version.status = "ARCHIVED"
+        draft.status = "PUBLISHED"
+        draft.published_at = datetime.now(timezone.utc)
+        template.status = "ACTIVE"
+        _audit(db, "SCRIPT_TEMPLATE_PUBLISHED", actor=actor, metadata={"template_id": template.id, "version": draft.version})
+        db.commit()
+        return _template_version_response(draft)
+
     @app.post("/api/v1/works", response_model=WorkResponse, status_code=status.HTTP_201_CREATED)
     def create_work(
         payload: WorkCreateRequest,
@@ -267,9 +728,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> WorkResponse:
         _check_csrf(request)
         now = datetime.now(timezone.utc)
-        work = Work(title=payload.title, owner_id=user.id)
+        template_version = _published_template_version(db, payload.template_id, payload.template_version_id)
+        settings = _validate_settings(template_version, payload.settings)
+        work = Work(
+            title=payload.title,
+            owner_id=user.id,
+            template_version_id=template_version.id,
+            settings_json=deepcopy(settings),
+        )
         db.add(work)
         db.flush()
+        work.creative_data = WorkCreativeData(work_id=work.id)
         db.add(
             WorkMember(
                 work_id=work.id,
@@ -279,7 +748,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 accepted_at=now,
             )
         )
-        _audit(db, "WORK_CREATED", actor=user, metadata={"work_id": work.id})
+        _audit(
+            db,
+            "WORK_CREATED",
+            actor=user,
+            metadata={"work_id": work.id, "template_version_id": template_version.id},
+        )
         db.commit()
         return _work_response(work)
 
@@ -301,6 +775,251 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_work(work_id: str, user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> WorkDetailResponse:
         work, member = _require_work_member(db, user, work_id)
         return _work_detail_response(work, member)
+
+    @app.get("/api/v1/works/{work_id}/settings", response_model=dict[str, Any])
+    def get_work_settings(work_id: str, user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> dict[str, Any]:
+        work, _ = _require_work_member(db, user, work_id)
+        return work.settings_json or {}
+
+    @app.patch("/api/v1/works/{work_id}/settings", response_model=WorkResponse)
+    @app.put("/api/v1/works/{work_id}/settings", response_model=WorkResponse, include_in_schema=False)
+    def update_work_settings(
+        work_id: str,
+        request: Request,
+        payload: Any = Body(...),
+        owner: Annotated[User, Depends(active_user)] = None,
+        db: Annotated[Session, Depends(get_db)] = None,
+    ) -> WorkResponse:
+        _check_csrf(request)
+        work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        incoming_settings = payload.get("settings", payload) if isinstance(payload, dict) else payload
+        if not isinstance(incoming_settings, dict):
+            raise _error("INVALID_TEMPLATE_VALUE", "settings must be an object", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        settings = _validate_settings(work.template_version, {**(work.settings_json or {}), **incoming_settings})
+        work.settings_json = deepcopy(settings)
+        work.revision += 1
+        work.updated_at = datetime.now(timezone.utc)
+        _audit(db, "WORK_SETTINGS_UPDATED", actor=owner, metadata={"work_id": work.id})
+        db.commit()
+        return _work_response(work)
+
+    def _normalize_stage(stage: str) -> str:
+        aliases = {"creative_brief": "brief", "character": "characters", "story_outline": "outline"}
+        normalized = aliases.get(stage, stage)
+        if normalized not in _CREATIVE_STAGES:
+            raise _error("INVALID_STAGE", "creative stage is invalid", status.HTTP_422_UNPROCESSABLE_CONTENT)
+        return normalized
+
+    @app.get("/api/v1/works/{work_id}/creative", response_model=CreativeResponse)
+    def get_creative(work_id: str, user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> CreativeResponse:
+        work, _ = _require_work_member(db, user, work_id)
+        return _creative_response(work)
+
+    @app.get("/api/v1/works/{work_id}/creative/{stage}", response_model=dict[str, Any])
+    @app.get("/api/v1/works/{work_id}/creative-{stage}", response_model=dict[str, Any], include_in_schema=False)
+    def get_creative_stage(work_id: str, stage: str, user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> dict[str, Any]:
+        stage = _normalize_stage(stage)
+        work, _ = _require_work_member(db, user, work_id)
+        data = _creative_data(work)
+        return {
+            "work_id": work.id,
+            "stage": stage,
+            "draft": getattr(data, f"{stage}_json"),
+            "confirmed": getattr(data, f"{stage}_confirmed_json"),
+            "revision": _stage_revision(data, stage),
+        }
+
+    @app.patch("/api/v1/works/{work_id}/creative/{stage}", response_model=dict[str, Any])
+    @app.put("/api/v1/works/{work_id}/creative/{stage}", response_model=dict[str, Any], include_in_schema=False)
+    @app.patch("/api/v1/works/{work_id}/creative-{stage}", response_model=dict[str, Any], include_in_schema=False)
+    @app.put("/api/v1/works/{work_id}/creative-{stage}", response_model=dict[str, Any], include_in_schema=False)
+    def update_creative_stage(
+        work_id: str,
+        stage: str,
+        request: Request,
+        payload: Any = Body(...),
+        user: Annotated[User, Depends(active_user)] = None,
+        db: Annotated[Session, Depends(get_db)] = None,
+    ) -> dict[str, Any]:
+        _check_csrf(request)
+        stage = _normalize_stage(stage)
+        work, _ = _require_work_member(db, user, work_id, {"OWNER", "EDITOR"})
+        content = payload.get("content") if isinstance(payload, dict) and set(payload) == {"content"} else payload
+        content = _validate_creative(work.template_version, stage, content)
+        data = _creative_data(work)
+        _set_stage(data, stage, content)
+        setattr(data, f"{stage}_revision", _stage_revision(data, stage) + 1)
+        work.revision += 1
+        work.updated_at = datetime.now(timezone.utc)
+        _audit(db, "CREATIVE_DRAFT_UPDATED", actor=user, metadata={"work_id": work.id, "stage": stage})
+        db.commit()
+        return {
+            "work_id": work.id,
+            "stage": stage,
+            "draft": getattr(data, f"{stage}_json"),
+            "confirmed": getattr(data, f"{stage}_confirmed_json"),
+            "revision": _stage_revision(data, stage),
+        }
+
+    @app.post("/api/v1/works/{work_id}/creative/{stage}/confirm", response_model=dict[str, Any])
+    @app.post("/api/v1/works/{work_id}/creative-{stage}/confirm", response_model=dict[str, Any], include_in_schema=False)
+    def confirm_creative_stage(
+        work_id: str,
+        stage: str,
+        request: Request,
+        owner: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> dict[str, Any]:
+        _check_csrf(request)
+        stage = _normalize_stage(stage)
+        work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        data = _creative_data(work)
+        if getattr(data, f"{stage}_confirmed_json") is not None:
+            raise _error("STAGE_ALREADY_CONFIRMED", "the creative stage is already confirmed; submit a change proposal", status.HTTP_409_CONFLICT)
+        previous = {"brief": None, "characters": "brief", "outline": "characters"}[stage]
+        if previous and getattr(data, f"{previous}_confirmed_json") is None:
+            raise _error("STAGE_ORDER_INVALID", "creative stages must be confirmed in order", status.HTTP_409_CONFLICT)
+        draft = getattr(data, f"{stage}_json")
+        if draft is None:
+            raise _error("CREATIVE_DRAFT_REQUIRED", "save a draft before confirming the stage", status.HTTP_409_CONFLICT)
+        draft = _validate_creative(work.template_version, stage, draft)
+        _set_stage(data, stage, draft, confirmed=True)
+        setattr(data, f"{stage}_revision", _stage_revision(data, stage) + 1)
+        work.revision += 1
+        work.updated_at = datetime.now(timezone.utc)
+        _audit(db, "CREATIVE_STAGE_CONFIRMED", actor=owner, metadata={"work_id": work.id, "stage": stage})
+        db.commit()
+        return {
+            "work_id": work.id,
+            "stage": stage,
+            "draft": getattr(data, f"{stage}_json"),
+            "confirmed": getattr(data, f"{stage}_confirmed_json"),
+            "revision": _stage_revision(data, stage),
+        }
+
+    @app.post("/api/v1/works/{work_id}/change-proposals", response_model=ChangeProposalResponse, status_code=status.HTTP_201_CREATED)
+    @app.post("/api/v1/works/{work_id}/proposals", response_model=ChangeProposalResponse, status_code=status.HTTP_201_CREATED, include_in_schema=False)
+    def submit_change_proposal(
+        work_id: str,
+        payload: ChangeProposalRequest,
+        request: Request,
+        user: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> ChangeProposalResponse:
+        _check_csrf(request)
+        stage = _normalize_stage(payload.stage)
+        work, _ = _require_work_member(db, user, work_id, {"OWNER", "EDITOR"})
+        data = _creative_data(work)
+        if getattr(data, f"{stage}_confirmed_json") is None:
+            raise _error("SETTING_NOT_CONFIRMED", "only confirmed settings can have change proposals", status.HTTP_409_CONFLICT)
+        content = _validate_creative(work.template_version, stage, payload.content)
+        existing = db.scalar(
+            select(ChangeProposal).where(
+                ChangeProposal.work_id == work.id,
+                ChangeProposal.stage == stage,
+                ChangeProposal.status == "PENDING",
+            )
+        )
+        if existing is not None:
+            raise _error("PROPOSAL_ALREADY_PENDING", "a change proposal for this setting is already pending", status.HTTP_409_CONFLICT)
+        proposal = ChangeProposal(
+            work_id=work.id,
+            stage=stage,
+            content_json=deepcopy(content),
+            base_revision=_stage_revision(data, stage),
+            status="PENDING",
+            submitted_by_user_id=user.id,
+        )
+        db.add(proposal)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            raise _error("PROPOSAL_ALREADY_PENDING", "a change proposal for this setting is already pending", status.HTTP_409_CONFLICT)
+        _audit(db, "CHANGE_PROPOSAL_SUBMITTED", actor=user, metadata={"work_id": work.id, "proposal_id": proposal.id, "stage": stage})
+        db.commit()
+        return _proposal_response(proposal)
+
+    @app.get("/api/v1/works/{work_id}/change-proposals", response_model=list[ChangeProposalResponse])
+    @app.get("/api/v1/works/{work_id}/proposals", response_model=list[ChangeProposalResponse], include_in_schema=False)
+    def list_change_proposals(
+        work_id: str,
+        user: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> list[ChangeProposalResponse]:
+        work, _ = _require_work_member(db, user, work_id)
+        proposals = db.scalars(
+            select(ChangeProposal).where(ChangeProposal.work_id == work.id).order_by(ChangeProposal.created_at)
+        ).all()
+        return [_proposal_response(proposal) for proposal in proposals]
+
+    def _review_proposal(
+        work_id: str,
+        proposal_id: str,
+        request: Request,
+        owner: User,
+        db: Session,
+        approved: bool,
+    ) -> ChangeProposalResponse:
+        _check_csrf(request)
+        work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        proposal = db.scalar(
+            select(ChangeProposal).where(ChangeProposal.id == proposal_id, ChangeProposal.work_id == work.id)
+        )
+        if proposal is None or proposal.status != "PENDING":
+            raise _error("PROPOSAL_NOT_FOUND", "pending change proposal not found", status.HTTP_404_NOT_FOUND)
+        data = _creative_data(work)
+        if proposal.base_revision != _stage_revision(data, proposal.stage):
+            proposal.status = "STALE"
+            proposal.reviewed_by_user_id = owner.id
+            proposal.reviewed_at = datetime.now(timezone.utc)
+            proposal.rejection_reason = "the setting changed after submission"
+            _audit(
+                db,
+                "CHANGE_PROPOSAL_STALE",
+                actor=owner,
+                metadata={"work_id": work.id, "proposal_id": proposal.id, "stage": proposal.stage},
+            )
+            db.commit()
+            raise _error("PROPOSAL_BASE_CHANGED", "the setting changed after this proposal was submitted; submit it again", status.HTTP_409_CONFLICT)
+        proposal.reviewed_by_user_id = owner.id
+        proposal.reviewed_at = datetime.now(timezone.utc)
+        if approved:
+            content = _validate_creative(work.template_version, proposal.stage, proposal.content_json)
+            _set_stage(data, proposal.stage, content, confirmed=True)
+            setattr(data, f"{proposal.stage}_revision", _stage_revision(data, proposal.stage) + 1)
+            proposal.status = "APPROVED"
+            work.revision += 1
+            work.updated_at = datetime.now(timezone.utc)
+            event_type = "CHANGE_PROPOSAL_APPROVED"
+        else:
+            proposal.status = "REJECTED"
+            event_type = "CHANGE_PROPOSAL_REJECTED"
+        _audit(db, event_type, actor=owner, metadata={"work_id": work.id, "proposal_id": proposal.id, "stage": proposal.stage})
+        db.commit()
+        return _proposal_response(proposal)
+
+    @app.post("/api/v1/works/{work_id}/change-proposals/{proposal_id}/approve", response_model=ChangeProposalResponse)
+    @app.post("/api/v1/works/{work_id}/proposals/{proposal_id}/approve", response_model=ChangeProposalResponse, include_in_schema=False)
+    def approve_change_proposal(
+        work_id: str,
+        proposal_id: str,
+        request: Request,
+        owner: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> ChangeProposalResponse:
+        return _review_proposal(work_id, proposal_id, request, owner, db, True)
+
+    @app.post("/api/v1/works/{work_id}/change-proposals/{proposal_id}/reject", response_model=ChangeProposalResponse)
+    @app.post("/api/v1/works/{work_id}/proposals/{proposal_id}/reject", response_model=ChangeProposalResponse, include_in_schema=False)
+    def reject_change_proposal(
+        work_id: str,
+        proposal_id: str,
+        request: Request,
+        owner: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> ChangeProposalResponse:
+        return _review_proposal(work_id, proposal_id, request, owner, db, False)
 
     @app.post("/api/v1/works/{work_id}/members/invitations", response_model=WorkMemberResponse, status_code=status.HTTP_201_CREATED)
     def invite_member(
@@ -503,6 +1222,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         work.trashed_at = now
         work.updated_at = now
         work.revision += 1
+        invalidate_work_external_state(db, work.id)
         _audit(db, "WORK_TRASHED", actor=owner, metadata={"work_id": work.id})
         db.commit()
         return _work_response(work)
@@ -526,6 +1246,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _audit(db, "WORK_RESTORED", actor=owner, metadata={"work_id": work.id})
         db.commit()
         return _work_response(work)
+
+    register_feature_routes(
+        app,
+        app_settings=app_settings,
+        active_user=active_user,
+        admin_user=admin_user,
+        check_csrf=_check_csrf,
+        require_work_member=_require_work_member,
+        error=_error,
+        audit=_audit,
+    )
 
     @app.post("/api/v1/auth/login", response_model=LoginResponse)
     @app.post("/api/v1/login", response_model=LoginResponse, include_in_schema=False)

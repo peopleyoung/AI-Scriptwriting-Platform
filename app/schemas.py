@@ -70,6 +70,9 @@ class AuditResponse(BaseModel):
 
 class WorkCreateRequest(BaseModel):
     title: str = Field(min_length=1, max_length=256)
+    template_id: str | None = Field(default=None, min_length=1, max_length=36)
+    template_version_id: str | None = Field(default=None, min_length=1, max_length=36)
+    settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class InviteMemberRequest(BaseModel):
@@ -119,6 +122,8 @@ class WorkResponse(BaseModel):
     id: str
     title: str
     owner_id: str
+    template_version_id: str | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
     status: str
     revision: int
     created_at: datetime
@@ -127,4 +132,81 @@ class WorkResponse(BaseModel):
 
 class WorkDetailResponse(WorkResponse):
     members: list[WorkMemberResponse]
+
+
+class TemplateCreateRequest(BaseModel):
+    slug: str | None = Field(default=None, min_length=1, max_length=128)
+    key: str | None = Field(default=None, min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    definition: dict[str, Any]
+
+    @model_validator(mode="after")
+    def require_slug(self):
+        if not self.slug and not self.key:
+            raise ValueError("slug or key is required")
+        if self.slug and self.key and self.slug != self.key:
+            raise ValueError("slug and key must match when both are provided")
+        if self.slug is None:
+            self.slug = self.key
+        return self
+
+
+class TemplateUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    definition: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def require_change(self):
+        if self.name is None and self.definition is None:
+            raise ValueError("name or definition is required")
+        return self
+
+
+class TemplateVersionResponse(BaseModel):
+    id: str
+    template_id: str
+    version: int
+    status: str
+    definition: dict[str, Any]
+    created_at: datetime
+    published_at: datetime | None
+
+
+class TemplateResponse(BaseModel):
+    id: str
+    slug: str
+    name: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    published_version: TemplateVersionResponse | None = None
+    versions: list[TemplateVersionResponse] = Field(default_factory=list)
+
+
+class CreativeResponse(BaseModel):
+    work_id: str
+    brief: dict[str, Any] | None
+    characters: list[dict[str, Any]] | None
+    outline: dict[str, Any] | None
+    confirmed: dict[str, Any | None]
+    revisions: dict[str, int]
+
+
+class ChangeProposalRequest(BaseModel):
+    stage: Literal["brief", "characters", "outline"]
+    content: Any
+
+
+class ChangeProposalResponse(BaseModel):
+    id: str
+    work_id: str
+    stage: str
+    content: Any
+    base_revision: int
+    status: str
+    submitted_by_user_id: str
+    reviewed_by_user_id: str | None
+    rejection_reason: str | None
+    created_at: datetime
+    reviewed_at: datetime | None
 
