@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     csrf_cookie_name: str = "scriptwriting_csrf"
     login_max_attempts: int = 5
     login_window_seconds: int = 60
+    external_encryption_key: str = "development-only-key"
+    download_ttl_seconds: int = 900
+    backup_dir: str = "./backups"
+    trash_retention_days: int = 30
+    max_running_generation_jobs: int = 1
+    max_running_generation_jobs_per_user: int = 1
+    max_running_generation_jobs_per_provider: int = 1
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
 

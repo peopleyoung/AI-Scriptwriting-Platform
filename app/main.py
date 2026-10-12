@@ -541,6 +541,18 @@ def _check_csrf(request: Request) -> None:
         raise _error("CSRF_TOKEN_REQUIRED", "a matching CSRF token is required", status.HTTP_403_FORBIDDEN)
 
 
+def _expected_revision(request: Request, payload: Any = None) -> int | None:
+    value = request.headers.get("if-match")
+    if value is None and isinstance(payload, dict):
+        value = payload.get("expected_revision")
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip('"'))
+    except (TypeError, ValueError):
+        raise _error("INVALID_REVISION", "expected revision must be an integer", status.HTTP_422_UNPROCESSABLE_CONTENT)
+
+
 def _load_session(request: Request, db: Session) -> tuple[SessionRecord, User] | None:
     token = request.cookies.get(request.app.state.settings.session_cookie_name)
     if not token:
@@ -793,11 +805,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _check_csrf(request)
         work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
         incoming_settings = payload.get("settings", payload) if isinstance(payload, dict) else payload
+        expected = _expected_revision(request, payload)
+        if expected is not None and expected != work.revision:
+            raise _error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
         if not isinstance(incoming_settings, dict):
             raise _error("INVALID_TEMPLATE_VALUE", "settings must be an object", status.HTTP_422_UNPROCESSABLE_CONTENT)
         settings = _validate_settings(work.template_version, {**(work.settings_json or {}), **incoming_settings})
         work.settings_json = deepcopy(settings)
         work.revision += 1
+        invalidate_work_external_state(db, work.id)
         work.updated_at = datetime.now(timezone.utc)
         _audit(db, "WORK_SETTINGS_UPDATED", actor=owner, metadata={"work_id": work.id})
         db.commit()
@@ -844,12 +860,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _check_csrf(request)
         stage = _normalize_stage(stage)
         work, _ = _require_work_member(db, user, work_id, {"OWNER", "EDITOR"})
-        content = payload.get("content") if isinstance(payload, dict) and set(payload) == {"content"} else payload
+        expected = _expected_revision(request, payload)
+        if expected is not None and expected != work.revision:
+            raise _error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
+        if isinstance(payload, dict) and "content" in payload and set(payload) <= {"content", "expected_revision"}:
+            content = payload["content"]
+        elif isinstance(payload, dict) and "expected_revision" in payload:
+            content = {key: value for key, value in payload.items() if key != "expected_revision"}
+        else:
+            content = payload
         content = _validate_creative(work.template_version, stage, content)
         data = _creative_data(work)
         _set_stage(data, stage, content)
         setattr(data, f"{stage}_revision", _stage_revision(data, stage) + 1)
         work.revision += 1
+        invalidate_work_external_state(db, work.id)
         work.updated_at = datetime.now(timezone.utc)
         _audit(db, "CREATIVE_DRAFT_UPDATED", actor=user, metadata={"work_id": work.id, "stage": stage})
         db.commit()
@@ -886,6 +911,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _set_stage(data, stage, draft, confirmed=True)
         setattr(data, f"{stage}_revision", _stage_revision(data, stage) + 1)
         work.revision += 1
+        invalidate_work_external_state(db, work.id)
         work.updated_at = datetime.now(timezone.utc)
         _audit(db, "CREATIVE_STAGE_CONFIRMED", actor=owner, metadata={"work_id": work.id, "stage": stage})
         db.commit()
@@ -990,6 +1016,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             setattr(data, f"{proposal.stage}_revision", _stage_revision(data, proposal.stage) + 1)
             proposal.status = "APPROVED"
             work.revision += 1
+            invalidate_work_external_state(db, work.id)
             work.updated_at = datetime.now(timezone.utc)
             event_type = "CHANGE_PROPOSAL_APPROVED"
         else:
@@ -1222,7 +1249,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         work.trashed_at = now
         work.updated_at = now
         work.revision += 1
-        invalidate_work_external_state(db, work.id)
+        invalidate_work_external_state(db, work.id, cancel_jobs=True)
         _audit(db, "WORK_TRASHED", actor=owner, metadata={"work_id": work.id})
         db.commit()
         return _work_response(work)
@@ -1238,6 +1265,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         work, _ = _require_work_member(db, owner, work_id, {"OWNER"}, allow_trashed=True)
         if work.status != "TRASHED":
             raise _error("WORK_NOT_TRASHED", "work is not in the trash", status.HTTP_409_CONFLICT)
+        if work.trashed_at is not None:
+            trashed_at = work.trashed_at if work.trashed_at.tzinfo else work.trashed_at.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - trashed_at).total_seconds() > app_settings.trash_retention_days * 86400:
+                raise _error("TRASH_RETENTION_EXPIRED", "the work can no longer be restored", status.HTTP_410_GONE)
         now = datetime.now(timezone.utc)
         work.status = "ACTIVE"
         work.trashed_at = None

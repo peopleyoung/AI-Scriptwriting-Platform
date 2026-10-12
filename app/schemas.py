@@ -210,3 +210,186 @@ class ChangeProposalResponse(BaseModel):
     created_at: datetime
     reviewed_at: datetime | None
 
+
+
+class DraftUpdateRequest(BaseModel):
+    content: dict[str, Any]
+    expected_revision: int | None = None
+    autosave: bool = True
+
+
+class VersionCreateRequest(BaseModel):
+    content: dict[str, Any] | None = None
+    expected_revision: int | None = None
+
+
+class ScriptVersionResponse(BaseModel):
+    id: str
+    work_id: str
+    source: str
+    author_user_id: str | None
+    parent_version_id: str | None
+    content: dict[str, Any]
+    content_hash: str
+    work_revision: int
+    created_at: datetime
+
+
+class VersionCompareResponse(BaseModel):
+    from_version: ScriptVersionResponse
+    to_version: ScriptVersionResponse
+    changed: bool
+
+
+class ReleaseCreateRequest(BaseModel):
+    version_id: str
+
+
+class ScriptReleaseResponse(BaseModel):
+    id: str
+    work_id: str
+    version_id: str
+    released_by_user_id: str
+    is_current: bool
+    created_at: datetime
+    version: ScriptVersionResponse
+
+
+class ProviderCreateRequest(BaseModel):
+    slug: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    adapter: Literal["openai", "anthropic", "mock"] = "mock"
+    retention_description: str | None = None
+    deletion_description: str | None = None
+    incident_description: str | None = None
+    credential: str | None = None
+
+
+class ProviderUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    retention_description: str | None = None
+    deletion_description: str | None = None
+    incident_description: str | None = None
+    enabled: bool | None = None
+    credential: str | None = None
+
+
+class ProviderResponse(BaseModel):
+    id: str
+    slug: str
+    name: str
+    adapter: str
+    enabled: bool
+    retention_description: str | None
+    deletion_description: str | None
+    incident_description: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ModelConfigCreateRequest(BaseModel):
+    provider_id: str
+    model_name: str = Field(min_length=1, max_length=256)
+    endpoint: str | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    credential: str | None = None
+
+
+class ModelConfigUpdateRequest(BaseModel):
+    model_name: str | None = Field(default=None, min_length=1, max_length=256)
+    endpoint: str | None = None
+    parameters: dict[str, Any] | None = None
+    credential: str | None = None
+
+
+class ModelConfigResponse(BaseModel):
+    id: str
+    provider_id: str
+    version: int
+    model_name: str
+    endpoint: str | None
+    parameters: dict[str, Any]
+    status: str
+    created_at: datetime
+
+
+class ConsentCreateRequest(BaseModel):
+    model_config_version_id: str
+    data_categories: list[str] = Field(min_length=1)
+    input_revision: int | None = None
+
+
+class ConsentResponse(BaseModel):
+    id: str
+    work_id: str
+    input_revision: int
+    model_config_version_id: str
+    data_categories: list[str]
+    status: str
+    granted_by_user_id: str
+    created_at: datetime
+    revoked_at: datetime | None
+
+
+class ConversationRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=10000)
+    consent_id: str
+
+
+class ConversationResponse(BaseModel):
+    id: str
+    work_id: str
+    user_id: str
+    user_message: str
+    assistant_message: str | None
+    status: str
+    invocation_id: str | None
+    created_at: datetime
+
+
+class GenerationJobRequest(BaseModel):
+    target_type: Literal["WORK", "EPISODE", "SCENE", "FRAGMENT"] = "WORK"
+    target_path: dict[str, Any] = Field(default_factory=dict)
+    instruction: str | None = Field(default=None, max_length=10000)
+    consent_id: str
+    model_config_version_id: str | None = None
+    input_revision: int | None = None
+    expected_revision: int | None = None
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=256)
+    auto_run: bool = False
+
+
+class GenerationJobResponse(BaseModel):
+    id: str
+    work_id: str
+    requested_by_user_id: str
+    idempotency_key: str
+    input_revision: int
+    target_type: str
+    target_path: dict[str, Any]
+    status: str
+    retry_count: int
+    error_code: str | None
+    error_message: str | None
+    result_version_id: str | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class ExportRequest(BaseModel):
+    format: Literal["markdown", "docx"]
+    release_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class ExportJobResponse(BaseModel):
+    id: str
+    work_id: str
+    release_id: str
+    format: str
+    status: str
+    download_url: str | None = None
+    download_expires_at: datetime | None = None
+    error_code: str | None = None
+    created_at: datetime
+
