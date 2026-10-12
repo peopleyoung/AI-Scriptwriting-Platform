@@ -22,3 +22,11 @@ curl http://localhost:8000/healthz
 ```
 
 The application runs `alembic upgrade head` before Uvicorn starts. The bootstrap password and setup secret should be supplied through environment configuration before exposing the service. For local HTTP-only development, set `APP_COOKIE_SECURE=false` explicitly.
+
+## 文档
+
+- [产品规划](docs/product-plan.md)
+- [技术评审](docs/technical-review.md)
+- [开发设计](docs/development-design.md)
+- [AutoWonder 开发任务包](docs/development-tasks.md)
+- [业务术语表](GLOSSARY.md)
