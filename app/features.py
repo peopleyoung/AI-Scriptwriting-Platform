@@ -43,7 +43,7 @@ from app.models import (
     WorkCreativeData,
     WorkMember,
 )
-from app.model_adapters import ModelAdapterError, adapter_for
+from app.model_adapters import ModelAdapterError, adapter_for, check_cancel
 from app.script_generation import allowed_blocks, validate_script, validate_target, build_messages, replace_target
 from app.worker import GenerationWorker
 from app.schemas import (
@@ -766,11 +766,28 @@ def register_feature_routes(
                         return True
                     with app.state.session_factory() as state_db:
                         record = state_db.get(GenerationJob, job_id)
-                        return record is None or record.status == "CANCELED"
+                        if record is None or record.status == "CANCELED":
+                            return True
+                        snapshot = state_db.get(Work, record.work_id)
+                        if snapshot is None or snapshot.status != "ACTIVE":
+                            return True
+                        if snapshot.revision != record.input_revision:
+                            raise ModelAdapterError("REVISION_CONFLICT", "work changed during generation")
+                        requester = state_db.get(User, record.requested_by_user_id)
+                        member = state_db.scalar(select(WorkMember).where(WorkMember.work_id == snapshot.id, WorkMember.user_id == record.requested_by_user_id, WorkMember.status == "ACCEPTED", WorkMember.role.in_(["OWNER", "EDITOR"])))
+                        if requester is None or not requester.is_active or member is None:
+                            raise ModelAdapterError("WORK_ACCESS_DENIED", "requesting account is unavailable")
+                        try:
+                            _active_consent(state_db, snapshot, record.consent_id, record.model_config_version_id)
+                        except ValueError as exc:
+                            raise ModelAdapterError(str(exc), "external consent is no longer valid") from None
+                        return False
             result = None
             for attempt in range(3):
                 try:
-                    result = adapter.invoke(messages=messages, model=model, parameters=parameters, timeout=app_settings.model_timeout_seconds, cancel_token=CancelToken())
+                    token = CancelToken()
+                    check_cancel(token)
+                    result = adapter.invoke(messages=messages, model=model, parameters=parameters, timeout=app_settings.model_timeout_seconds, cancel_token=token)
                     break
                 except ModelAdapterError as exc:
                     if not exc.retryable or attempt == 2:

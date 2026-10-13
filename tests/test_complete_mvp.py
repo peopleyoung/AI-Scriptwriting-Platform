@@ -192,3 +192,21 @@ def test_fatal_model_error_has_safe_metadata(studio, monkeypatch):
     records=client.get(f'/api/v1/works/{work}/model-invocations')
     assert 'private-prompt' not in records.text and 'private-credential' not in records.text
     assert records.json()[-1]['error_code']=='AUTHENTICATION_ERROR'
+
+
+def test_changed_input_is_not_transmitted_again_on_retry(studio, monkeypatch):
+    from app.model_adapters import ModelAdapterError
+    client, work, config, draft = studio
+    calls = []
+    def invoke(self, **kwargs):
+        calls.append(kwargs)
+        edited = deepcopy(draft)
+        edited['episodes'][0]['title'] = '模型请求期间的新修改'
+        assert client.patch(f'/api/v1/works/{work}/draft', json={'content':edited}).status_code == 200
+        raise ModelAdapterError('RATE_LIMITED','temporarily unavailable',retryable=True)
+    monkeypatch.setattr(MockModelAdapter,'invoke',invoke)
+    ident=job(client,work,config,consent(client,work,config),True)
+    done=wait_job(client,work,ident)
+    assert done['status']=='FAILED' and done['error_code']=='REVISION_CONFLICT'
+    assert len(calls)==1
+    assert client.get(f'/api/v1/works/{work}/versions').json()==[]
