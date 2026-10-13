@@ -1,7 +1,7 @@
 # 02: 完整创作 MVP 与 GitHub 交付
 
 Type: task
-Status: claimed
+Status: resolved
 
 ## 范围
 
@@ -14,7 +14,7 @@ Status: claimed
 - [x] 对话按确认的数据范围构建输入，保存后使旧输入授权失效。
 - [x] 账号、供应商/模型、模板和运行记录有可操作管理入口。
 - [x] 自动保存只更新草稿；场景生成、成员角色、所有权和作品参数可操作。
-- [ ] 后端、模型契约、浏览器、CI 与构建通过，GitHub 代码已推送并有审核入口。
+- [x] 后端、模型契约、浏览器、CI 与构建通过，GitHub 代码已推送并有审核入口。
 
 ## Answer
 
@@ -23,3 +23,7 @@ Status: claimed
 验证：46 项后端测试、1 项独立 PostgreSQL 集成测试通过；6 组 Playwright 流程通过，场景选择改进后相关 2 组复测通过。Docker 镜像构建、PostgreSQL 迁移及并发任务/取消、Compose 配置、生产容器健康与静态站点通过。修复旧迁移编号超过 PostgreSQL Alembic 默认长度的问题。构建受本地 PyPI 网络影响，实际 Docker 验证使用可配置 PIP_INDEX_URL 指向清华 PyPI 镜像；代码默认仍使用 PyPI。
 
 GitHub Actions 已加入同等验收。没有使用真实外部供应商凭证进行付费调用；HTTP 合约由本地替身验证。生产部署说明及单进程限制见 [README](../../../README.md)。GitHub 交付分支为 feat/focus-writing-mvp，提交并推送后建立审核 PR。
+
+## GitHub 交付
+
+实现提交 da401cd 已推送到 feat/focus-writing-mvp，审核入口：[PR #1](https://github.com/peopleyoung/AI-Scriptwriting-Platform/pull/1)。本地 Docker/PostgreSQL 预览使用独立测试数据，未改动真实作品。
