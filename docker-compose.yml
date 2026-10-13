@@ -16,6 +16,10 @@ services:
   app:
     build: .
     environment:
+      APP_ENVIRONMENT: production
+      APP_EXTERNAL_ENCRYPTION_KEY: ${APP_EXTERNAL_ENCRYPTION_KEY:?Set a stable random encryption key of at least 32 characters}
+      APP_BACKUP_DIR: /app/backups
+      APP_MODEL_TIMEOUT_SECONDS: ${APP_MODEL_TIMEOUT_SECONDS:-120}
       APP_DATABASE_URL: postgresql+psycopg://scriptwriting:scriptwriting@db:5432/scriptwriting
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-true}
       APP_AUTO_CREATE_SCHEMA: "false"
@@ -25,6 +29,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - backup_data:/app/backups
     ports:
       - "8000:8000"
     healthcheck:
@@ -35,3 +41,4 @@ services:
 
 volumes:
   postgres_data:
+  backup_data:

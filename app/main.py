@@ -2,8 +2,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from copy import deepcopy
 from typing import Any, Annotated
+from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -446,6 +448,8 @@ def _require_work_member(
     allow_trashed: bool = False,
 ) -> tuple[Work, WorkMember]:
     work = _get_work(db, work_id)
+    if roles is not None:
+        work = db.scalar(select(Work).where(Work.id == work_id).with_for_update().execution_options(populate_existing=True))
     if work.status == "TRASHED" and not allow_trashed:
         raise _error("WORK_NOT_FOUND", "work not found", status.HTTP_404_NOT_FOUND)
     member = db.scalar(
@@ -492,7 +496,11 @@ def _member_response(member: WorkMember) -> WorkMemberResponse:
 
 def _work_detail_response(work: Work, member: WorkMember) -> WorkDetailResponse:
     members = work.members if member.role == "OWNER" else [item for item in work.members if item.status == "ACCEPTED"]
-    return WorkDetailResponse(**_work_response(work).model_dump(), members=[_member_response(item) for item in members])
+    return WorkDetailResponse(
+        **_work_response(work).model_dump(),
+        members=[_member_response(item) for item in members],
+        template_definition=deepcopy(work.template_version.definition_json) if work.template_version else {},
+    )
 
 
 def _cookie_options(settings: Settings) -> dict:
@@ -614,8 +622,24 @@ async def lifespan(app: FastAPI):
                 db.flush()
                 _audit(db, "ADMIN_BOOTSTRAPPED", target=admin)
                 db.commit()
-    yield
-    app.state.engine.dispose()
+    worker = app.state.generation_worker
+    with app.state.session_factory() as db:
+        from app.models import GenerationJob
+        # Interrupted requests require a fresh explicit retry; queued work resumes.
+        for job in db.scalars(select(GenerationJob).where(GenerationJob.status == "RUNNING")).all():
+            job.status = "FAILED"
+            job.error_code = "WORKER_INTERRUPTED"
+            job.finished_at = datetime.now(timezone.utc)
+        queued_ids = list(db.scalars(select(GenerationJob.id).where(GenerationJob.status == "QUEUED")))
+        db.commit()
+    worker.start()
+    for job_id in queued_ids:
+        worker.enqueue(job_id)
+    try:
+        yield
+    finally:
+        worker.stop()
+        app.state.engine.dispose()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -783,6 +807,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ).all()
         return [_work_response(work) for work in works]
 
+    @app.get("/api/v1/trash", response_model=list[WorkResponse])
+    def list_trash(user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> list[WorkResponse]:
+        works = db.scalars(
+            select(Work).join(WorkMember, WorkMember.work_id == Work.id).where(
+                Work.owner_id == user.id,
+                WorkMember.user_id == user.id,
+                WorkMember.role == "OWNER",
+                WorkMember.status == "ACCEPTED",
+                Work.status == "TRASHED",
+            ).order_by(Work.trashed_at.desc())
+        ).all()
+        return [_work_response(work) for work in works]
+
+    @app.get("/api/v1/invitations")
+    def list_pending_invitations(user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> list[dict[str, Any]]:
+        members = db.scalars(
+            select(WorkMember).join(Work, Work.id == WorkMember.work_id).where(
+                WorkMember.user_id == user.id,
+                WorkMember.status == "PENDING",
+                Work.status == "ACTIVE",
+            ).order_by(WorkMember.invited_at.desc())
+        ).all()
+        return [
+            {"work_id": member.work_id, "title": member.work.title, "role": member.role, "invited_at": member.invited_at}
+            for member in members
+        ]
+
     @app.get("/api/v1/works/{work_id}", response_model=WorkDetailResponse)
     def get_work(work_id: str, user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> WorkDetailResponse:
         work, member = _require_work_member(db, user, work_id)
@@ -811,6 +862,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not isinstance(incoming_settings, dict):
             raise _error("INVALID_TEMPLATE_VALUE", "settings must be an object", status.HTTP_422_UNPROCESSABLE_CONTENT)
         settings = _validate_settings(work.template_version, {**(work.settings_json or {}), **incoming_settings})
+        if isinstance(payload, dict) and "title" in payload:
+            title = payload["title"]
+            if not isinstance(title, str) or not title.strip() or len(title) > 256:
+                raise _error("INVALID_WORK_TITLE", "title must contain 1 to 256 characters", status.HTTP_422_UNPROCESSABLE_CONTENT)
+            work.title = title.strip()
         work.settings_json = deepcopy(settings)
         work.revision += 1
         invalidate_work_external_state(db, work.id)
@@ -898,6 +954,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _check_csrf(request)
         stage = _normalize_stage(stage)
         work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        expected = _expected_revision(request)
+        if expected is not None and expected != work.revision:
+            raise _error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
         data = _creative_data(work)
         if getattr(data, f"{stage}_confirmed_json") is not None:
             raise _error("STAGE_ALREADY_CONFIRMED", "the creative stage is already confirmed; submit a change proposal", status.HTTP_409_CONFLICT)
@@ -1220,6 +1279,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise _error("OWNERSHIP_TARGET_INVALID", "ownership can only transfer to an active member", status.HTTP_409_CONFLICT)
         now = datetime.now(timezone.utc)
         work.owner_id = target.id
+        work.revision += 1
+        invalidate_work_external_state(db, work.id)
         work.updated_at = now
         owner_member.role = "EDITOR"
         target_member.role = "OWNER"
@@ -1432,6 +1493,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def audit_logs(_: Annotated[User, Depends(admin_user)], db: Annotated[Session, Depends(get_db)]) -> list[AuditResponse]:
         logs = db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc())).all()
         return [AuditResponse(id=log.id, event_type=log.event_type, actor_user_id=log.actor_user_id, target_user_id=log.target_user_id, metadata=log.metadata_json or {}, created_at=log.created_at) for log in logs]
+
+    frontend_dist = Path(app_settings.frontend_dist) if app_settings.frontend_dist else Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    if (frontend_dist / "index.html").is_file():
+        app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
 
     return app
 

@@ -16,3 +16,10 @@ __pycache__/
 !.env.example
 alembic/versions/*.pyc
 *.egg-info/
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+frontend/*.tsbuildinfo
+
+backups/

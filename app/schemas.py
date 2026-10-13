@@ -132,6 +132,7 @@ class WorkResponse(BaseModel):
 
 class WorkDetailResponse(WorkResponse):
     members: list[WorkMemberResponse]
+    template_definition: dict[str, Any] = Field(default_factory=dict)
 
 
 class TemplateCreateRequest(BaseModel):
@@ -315,7 +316,7 @@ class ModelConfigResponse(BaseModel):
 
 class ConsentCreateRequest(BaseModel):
     model_config_version_id: str
-    data_categories: list[str] = Field(min_length=1)
+    data_categories: list[Literal["conversation", "settings", "outline", "script"]] = Field(min_length=1)
     input_revision: int | None = None
 
 

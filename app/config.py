@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +26,14 @@ class Settings(BaseSettings):
     max_running_generation_jobs: int = 1
     max_running_generation_jobs_per_user: int = 1
     max_running_generation_jobs_per_provider: int = 1
+    model_timeout_seconds: float = 120
+    frontend_dist: str | None = None
+
+    @model_validator(mode="after")
+    def require_production_encryption_key(self):
+        if self.environment == "production" and (len(self.external_encryption_key) < 32 or self.external_encryption_key == "development-only-key" or self.external_encryption_key.startswith("change-this")):
+            raise ValueError("production requires APP_EXTERNAL_ENCRYPTION_KEY with at least 32 characters")
+        return self
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
 
