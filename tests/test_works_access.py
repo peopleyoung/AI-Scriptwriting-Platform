@@ -202,3 +202,57 @@ def test_only_owner_can_manage_members_and_role_changes_are_audited(tmp_path: Pa
         audit = client.get("/api/v1/admin/audit")
         assert audit.status_code == 200
         assert "WORK_MEMBER_ROLE_CHANGED" in audit.text
+
+
+def test_frontend_lists_expose_only_authorized_metadata(tmp_path: Path) -> None:
+    with client_for(tmp_path) as client:
+        assert client.post("/api/v1/admin/bootstrap", json={"username": "admin", "password": "Admin-password-123"}).status_code == 201
+        login(client, "admin", "Admin-password-123")
+        for username in ("writer", "editor"):
+            assert client.post("/api/v1/admin/users", json={"username": username, "password": "Writer-password-123"}).status_code == 201
+        client.post("/api/v1/auth/logout")
+        login(client, "writer", "Writer-password-123")
+        work = client.post("/api/v1/works", json={"title": "私有故事"}).json()
+        work_id = work["id"]
+        detail = client.get(f"/api/v1/works/{work_id}").json()
+        assert detail["template_definition"]["script_structure"]["blocks"]
+        assert client.post(f"/api/v1/works/{work_id}/members/invitations", json={"username": "editor", "role": "EDITOR"}).status_code == 201
+        assert client.get("/api/v1/invitations").json() == []
+        client.post("/api/v1/auth/logout")
+        login(client, "editor", "Writer-password-123")
+        invitations = client.get("/api/v1/invitations").json()
+        assert len(invitations) == 1
+        assert set(invitations[0]) == {"work_id", "title", "role", "invited_at"}
+        assert invitations[0]["work_id"] == work_id
+        assert client.get(f"/api/v1/works/{work_id}/workspace").status_code == 403
+        assert client.get("/api/v1/trash").json() == []
+        client.post("/api/v1/auth/logout")
+        login(client, "writer", "Writer-password-123-changed")
+        assert client.post(f"/api/v1/works/{work_id}/trash").status_code == 200
+        trash = client.get("/api/v1/trash").json()
+        assert [item["id"] for item in trash] == [work_id]
+        assert not {"draft", "creative", "members", "template_definition"} & set(trash[0])
+        client.post("/api/v1/auth/logout")
+        login(client, "editor", "Writer-password-123-changed")
+        assert client.get("/api/v1/invitations").json() == []
+        assert client.get("/api/v1/trash").json() == []
+        client.post("/api/v1/auth/logout")
+        login(client, "admin", "Admin-password-123-changed")
+        assert client.get("/api/v1/trash").json() == []
+        assert client.get(f"/api/v1/works/{work_id}").status_code == 404
+
+
+def test_confirmation_does_not_accept_an_unseen_draft_revision(tmp_path: Path) -> None:
+    with client_for(tmp_path) as client:
+        assert client.post("/api/v1/admin/bootstrap", json={"username": "admin", "password": "Admin-password-123"}).status_code == 201
+        login(client, "admin", "Admin-password-123")
+        work_id = client.post("/api/v1/works", json={"title": "确认边界"}).json()["id"]
+        assert client.patch(f"/api/v1/works/{work_id}/creative/brief", json={"theme": "原主题"}).status_code == 200
+        assert client.patch(f"/api/v1/works/{work_id}/creative/brief", json={"theme": "协作者的新主题"}).status_code == 200
+        stale = client.post(f"/api/v1/works/{work_id}/creative/brief/confirm", headers={"if-match": "1"})
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "REVISION_CONFLICT"
+        assert client.get(f"/api/v1/works/{work_id}/creative/brief").json()["confirmed"] is None
+        accepted = client.post(f"/api/v1/works/{work_id}/creative/brief/confirm", headers={"if-match": "2"})
+        assert accepted.status_code == 200
+        assert accepted.json()["confirmed"] == {"theme": "协作者的新主题"}

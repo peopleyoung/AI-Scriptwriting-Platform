@@ -314,6 +314,7 @@ class GenerationJob(Base):
     __table_args__ = (
         UniqueConstraint("work_id", "idempotency_key", name="uq_generation_jobs_work_idempotency"),
         Index("ix_generation_jobs_work_status", "work_id", "status"),
+        Index("uq_generation_jobs_active_work", "work_id", unique=True, sqlite_where=text("status IN ('QUEUED', 'RUNNING')"), postgresql_where=text("status IN ('QUEUED', 'RUNNING')")),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))

@@ -1,10 +1,4 @@
-"""Application slices that follow the versioned-script, model and export seams.
-
-The service intentionally keeps the worker boundary small: the default adapter is a
-deterministic local adapter suitable for development and tests. A deployment can
-replace ``run_generation_job`` with a queue worker without changing the API or
-authorization checks.
-"""
+"""Versioned scripts, consent-filtered model calls and durable MVP jobs."""
 
 from __future__ import annotations
 
@@ -23,11 +17,12 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request, Response, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.crypto import encrypt_bytes, decrypt_bytes, encrypt_secret, decrypt_secret
 from app.db import get_db
 from app.models import (
     AuditLog,
@@ -41,12 +36,16 @@ from app.models import (
     ModelProvider,
     ScriptRelease,
     ScriptVersion,
+    ScriptTemplate,
+    ScriptTemplateVersion,
     User,
     Work,
     WorkCreativeData,
     WorkMember,
 )
-from app.model_adapters import ModelAdapterError, adapter_for
+from app.model_adapters import ModelAdapterError, adapter_for, check_cancel
+from app.script_generation import allowed_blocks, validate_script, validate_target, build_messages, replace_target
+from app.worker import GenerationWorker
 from app.schemas import (
     ConsentCreateRequest,
     ConsentResponse,
@@ -91,53 +90,21 @@ def _json_hash(value: Any) -> str:
 
 
 def _validate_script_content(content: Any) -> dict[str, Any]:
-    if not isinstance(content, dict):
-        raise ValueError("SCRIPT_STRUCTURE_INVALID")
-    episodes = content.get("episodes")
-    if episodes is None:
-        if content:
-            raise ValueError("SCRIPT_STRUCTURE_INVALID")
-        return content
-    if not isinstance(episodes, list):
-        raise ValueError("SCRIPT_STRUCTURE_INVALID")
-    for episode in episodes:
-        if not isinstance(episode, dict) or not isinstance(episode.get("scenes", []), list):
-            raise ValueError("SCRIPT_STRUCTURE_INVALID")
-        for scene in episode.get("scenes", []):
-            if not isinstance(scene, dict) or not isinstance(scene.get("fragments", []), list):
-                raise ValueError("SCRIPT_STRUCTURE_INVALID")
-            for fragment in scene.get("fragments", []):
-                if not isinstance(fragment, dict) or "id" not in fragment or not isinstance(fragment.get("blocks", []), list):
-                    raise ValueError("SCRIPT_STRUCTURE_INVALID")
-                for block in fragment.get("blocks", []):
-                    if not isinstance(block, dict) or not isinstance(block.get("type"), str) or "text" not in block:
-                        raise ValueError("SCRIPT_STRUCTURE_INVALID")
-    return content
+    return validate_script(content)
 
 
 def _encrypt_secret(value: str | None, settings: Settings) -> str | None:
     if value is None:
         return None
-    key = hashlib.sha256((settings.external_encryption_key or "development-only-key").encode()).digest()
-    raw = value.encode()
-    stream = bytes(raw[index] ^ key[index % len(key)] for index in range(len(raw)))
-    tag = hashlib.sha256(key + stream).digest()[:16]
-    return base64.urlsafe_b64encode(tag + stream).decode()
+    return encrypt_secret(value, settings.external_encryption_key)
 
 
 def _crypt_payload(payload: bytes, settings: Settings) -> bytes:
-    key = hashlib.sha256((settings.external_encryption_key or "development-only-key").encode()).digest()
-    stream = bytes(payload[index] ^ key[index % len(key)] for index in range(len(payload)))
-    tag = hashlib.sha256(key + stream).digest()[:16]
-    return tag + stream
+    return encrypt_bytes(payload, settings.external_encryption_key)
 
 
 def _decrypt_payload(payload: bytes, settings: Settings) -> bytes:
-    key = hashlib.sha256((settings.external_encryption_key or "development-only-key").encode()).digest()
-    tag, stream = payload[:16], payload[16:]
-    if hashlib.sha256(key + stream).digest()[:16] != tag:
-        raise ValueError("invalid encrypted backup")
-    return bytes(stream[index] ^ key[index % len(key)] for index in range(len(stream)))
+    return decrypt_bytes(payload, settings.external_encryption_key)
 
 
 def _provider_response(provider: ModelProvider) -> ProviderResponse:
@@ -322,38 +289,6 @@ def _xml_escape(value: Any) -> str:
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
-def _target_content(content: dict[str, Any], target_type: str, path: dict[str, Any], instruction: str | None) -> dict[str, Any]:
-    result = deepcopy(content)
-    marker = {"type": "ACTION", "text": instruction or "模型生成内容"}
-    if target_type == "WORK" or not path:
-        result.setdefault("episodes", [{"number": 1, "scenes": [{"number": 1, "fragments": [{"id": "generated", "blocks": []}]}]}])
-        try:
-            result["episodes"][0]["scenes"][0]["fragments"][0].setdefault("blocks", []).append(marker)
-        except (KeyError, IndexError, TypeError):
-            result["generated"] = marker
-        return result
-    episode_number = path.get("episode", path.get("episode_number", 1))
-    scene_number = path.get("scene", path.get("scene_number", 1))
-    fragment_id = str(path.get("fragment", path.get("fragment_id", "generated")))
-    episodes = result.setdefault("episodes", [])
-    episode = next((item for item in episodes if isinstance(item, dict) and item.get("number") == episode_number), None)
-    if episode is None:
-        episode = {"number": episode_number, "scenes": []}
-        episodes.append(episode)
-    scenes = episode.setdefault("scenes", [])
-    scene = next((item for item in scenes if isinstance(item, dict) and item.get("number") == scene_number), None)
-    if scene is None:
-        scene = {"number": scene_number, "fragments": []}
-        scenes.append(scene)
-    fragments = scene.setdefault("fragments", [])
-    fragment = next((item for item in fragments if isinstance(item, dict) and str(item.get("id")) == fragment_id), None)
-    if fragment is None:
-        fragment = {"id": fragment_id, "blocks": []}
-        fragments.append(fragment)
-    fragment.setdefault("blocks", []).append(marker)
-    return result
-
-
 def _active_consent(db: Session, work: Work, consent_id: str, model_config_id: str | None = None) -> ExternalConsent:
     consent = db.scalar(select(ExternalConsent).where(ExternalConsent.id == consent_id, ExternalConsent.work_id == work.id))
     if consent is None or consent.status != "ACTIVE" or consent.input_revision != work.revision:
@@ -398,6 +333,25 @@ def register_feature_routes(
     def _require(db: Session, user: User, work_id: str, roles: set[str] | None = None, *, allow_trashed: bool = False):
         return require_work_member(db, user, work_id, roles, allow_trashed=allow_trashed)
 
+    def execute_queued(job_id: str):
+        with app.state.session_factory() as worker_db:
+            try:
+                job = worker_db.get(GenerationJob, job_id)
+                if job is not None and job.status == "QUEUED":
+                    run_generation_job(worker_db, job)
+                    worker_db.commit()
+            except Exception:
+                worker_db.rollback()
+                job = worker_db.get(GenerationJob, job_id)
+                if job is not None and job.status in {"QUEUED", "RUNNING"}:
+                    job.status = "FAILED"
+                    job.error_code = "WORKER_ERROR"
+                    job.error_message = "generation worker could not complete the job"
+                    job.finished_at = _now()
+                    worker_db.commit()
+
+    app.state.generation_worker = GenerationWorker(execute_queued)
+
     @app.get("/api/v1/works/{work_id}/draft")
     @app.get("/api/v1/works/{work_id}/script/draft", include_in_schema=False)
     def get_draft(work_id: str, user: User = Depends(active_user), db: Session = Depends(get_db)):
@@ -430,12 +384,14 @@ def register_feature_routes(
         if payload.expected_revision is not None and payload.expected_revision != work.revision:
             raise error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
         try:
-            work.draft_json = deepcopy(_validate_script_content(payload.content))
+            content = deepcopy(validate_script(payload.content, allowed_blocks(work)))
         except ValueError as exc:
             raise error(str(exc), "script content must use episode, scene, fragment and block structure", status.HTTP_422_UNPROCESSABLE_CONTENT)
-        work.revision += 1
+        changed = db.execute(update(Work).where(Work.id == work.id, Work.revision == work.revision, Work.status == "ACTIVE").values(draft_json=content, revision=work.revision + 1, updated_at=_now()))
+        if changed.rowcount != 1:
+            raise error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
+        db.refresh(work)
         invalidate_work_external_state(db, work.id)
-        work.updated_at = _now()
         audit(db, "WORK_DRAFT_AUTOSAVED" if payload.autosave else "WORK_DRAFT_UPDATED", actor=user, metadata={"work_id": work.id, "revision": work.revision})
         db.commit()
         return {"work_id": work.id, "content": work.draft_json, "revision": work.revision}
@@ -444,11 +400,14 @@ def register_feature_routes(
         if expected_revision is not None and expected_revision != work.revision:
             raise error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
         try:
-            content = _validate_script_content(content)
+            content = validate_script(content, allowed_blocks(work))
         except ValueError as exc:
             raise error(str(exc), "script content must use episode, scene, fragment and block structure", status.HTTP_422_UNPROCESSABLE_CONTENT)
-        work.draft_json = deepcopy(content)
-        work.revision += 1
+        previous_revision = work.revision
+        changed = db.execute(update(Work).where(Work.id == work.id, Work.revision == previous_revision, Work.status == "ACTIVE").values(draft_json=deepcopy(content), revision=previous_revision + 1, updated_at=_now()))
+        if changed.rowcount != 1:
+            raise error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
+        db.refresh(work)
         invalidate_work_external_state(db, work.id)
         version = ScriptVersion(work_id=work.id, source=source, author_user_id=user.id, parent_version_id=parent_version_id, content_json=deepcopy(content), content_hash=_json_hash(content), work_revision=work.revision)
         db.add(version)
@@ -592,6 +551,9 @@ def register_feature_routes(
                 for consent in db.scalars(select(ExternalConsent).where(ExternalConsent.model_config_version_id == latest.id, ExternalConsent.status == "ACTIVE")).all():
                     consent.status = "REVOKED"
                     consent.revoked_at = _now()
+        for consent in db.scalars(select(ExternalConsent).join(ModelConfigVersion, ModelConfigVersion.id == ExternalConsent.model_config_version_id).where(ModelConfigVersion.provider_id == provider.id, ExternalConsent.status == "ACTIVE")).all():
+            consent.status = "REVOKED"
+            consent.revoked_at = _now()
         audit(db, "MODEL_PROVIDER_UPDATED", actor=actor, metadata={"provider_id": provider.id, "enabled": provider.enabled})
         db.commit()
         return _provider_response(provider)
@@ -636,6 +598,8 @@ def register_feature_routes(
         previous = db.get(ModelConfigVersion, config_id)
         if previous is None:
             raise error("MODEL_CONFIG_NOT_FOUND", "model configuration not found", status.HTTP_404_NOT_FOUND)
+        if previous.status != "ACTIVE":
+            raise error("MODEL_CONFIG_NOT_AVAILABLE", "edit the active model configuration", status.HTTP_409_CONFLICT)
         config = ModelConfigVersion(provider_id=previous.provider_id, version=previous.version + 1, model_name=payload.model_name or previous.model_name, endpoint=payload.endpoint if payload.endpoint is not None else previous.endpoint, parameters_json=payload.parameters if payload.parameters is not None else (previous.parameters_json or {}), credential_ciphertext=_encrypt_secret(payload.credential, app_settings) if payload.credential is not None else previous.credential_ciphertext, created_by_user_id=actor.id)
         previous.status = "RETIRED"
         for consent in db.scalars(select(ExternalConsent).where(ExternalConsent.model_config_version_id == previous.id, ExternalConsent.status == "ACTIVE")).all():
@@ -708,16 +672,43 @@ def register_feature_routes(
         config = db.get(ModelConfigVersion, consent.model_config_version_id)
         if config is None or config.provider is None:
             raise error("MODEL_CONFIG_NOT_AVAILABLE", "model configuration is unavailable", status.HTTP_409_CONFLICT)
-        trace_id = uuid4().hex
-        invocation = ModelInvocationRecord(work_id=work.id, provider_id=config.provider_id, model_config_version_id=config.id, status="SUCCEEDED", usage_json={"input_tokens": len(payload.message), "output_tokens": 0}, duration_ms=0, trace_id=trace_id)
-        db.add(invocation)
-        db.flush()
-        conversation = CreativeConversation(work_id=work.id, user_id=user.id, user_message=payload.message, assistant_message=f"已记录创作讨论：{payload.message}", invocation_id=invocation.id)
-        db.add(conversation)
-        db.flush()
-        audit(db, "CREATIVE_CONVERSATION_CREATED", actor=user, metadata={"work_id": work.id, "conversation_id": conversation.id, "invocation_id": invocation.id})
-        db.commit()
-        return _conversation_response(conversation)
+        if "conversation" not in consent.data_categories_json:
+            raise error("CONSENT_SCOPE_MISMATCH", "conversation transmission was not authorized", status.HTTP_409_CONFLICT)
+        messages = build_messages(db, work, consent, payload.message)
+        revision, actor_id, config_id, provider_id = work.revision, user.id, config.id, config.provider_id
+        model, parameters = config.model_name, deepcopy(config.parameters_json or {})
+        adapter = adapter_for(config.provider.adapter, endpoint=config.endpoint, credential=decrypt_secret(config.credential_ciphertext, app_settings.external_encryption_key))
+        db.rollback()
+        started = time.monotonic()
+        try:
+            result = adapter.invoke(messages=messages, model=model, parameters=parameters, timeout=app_settings.model_timeout_seconds)
+            db.expire_all()
+            user = db.get(User, actor_id)
+            if user is None or not user.is_active:
+                raise ModelAdapterError("WORK_ACCESS_DENIED", "requesting account is unavailable")
+            work, _ = _require(db, user, work_id, {"OWNER", "EDITOR"})
+            if work.revision != revision:
+                raise ModelAdapterError("REVISION_CONFLICT", "work changed during conversation")
+            _active_consent(db, work, payload.consent_id, config_id)
+            changed = db.execute(update(Work).where(Work.id == work.id, Work.revision == revision, Work.status == "ACTIVE").values(revision=revision + 1, updated_at=_now()))
+            if changed.rowcount != 1:
+                raise ModelAdapterError("REVISION_CONFLICT", "work changed during conversation")
+            invocation = ModelInvocationRecord(work_id=work_id, provider_id=provider_id, model_config_version_id=config_id, status="SUCCEEDED", usage_json=result.usage, duration_ms=int((time.monotonic() - started) * 1000), trace_id=uuid4().hex)
+            db.add(invocation)
+            db.flush()
+            conversation = CreativeConversation(work_id=work_id, user_id=actor_id, user_message=payload.message, assistant_message=result.text, invocation_id=invocation.id)
+            db.add(conversation)
+            invalidate_work_external_state(db, work_id)
+            db.flush()
+            audit(db, "CREATIVE_CONVERSATION_CREATED", actor=user, metadata={"work_id": work_id, "conversation_id": conversation.id, "invocation_id": invocation.id})
+            db.commit()
+            return _conversation_response(conversation)
+        except Exception as exc:
+            db.rollback()
+            code = exc.code if isinstance(exc, ModelAdapterError) else str(exc) if isinstance(exc, ValueError) and str(exc).startswith("CONSENT_") else "WORK_ACCESS_DENIED" if getattr(exc, "status_code", None) == 403 else "MODEL_INVOCATION_FAILED"
+            db.add(ModelInvocationRecord(work_id=work_id, provider_id=provider_id, model_config_version_id=config_id, status="FAILED", usage_json={}, duration_ms=int((time.monotonic() - started) * 1000), error_code=code, trace_id=uuid4().hex))
+            db.commit()
+            raise error(code, "conversation did not complete; please try again", status.HTTP_409_CONFLICT if code.startswith("CONSENT_") or code in {"REVISION_CONFLICT", "WORK_ACCESS_DENIED"} else status.HTTP_502_BAD_GATEWAY)
 
     @app.get("/api/v1/works/{work_id}/conversations", response_model=list[ConversationResponse])
     def list_conversations(work_id: str, user: User = Depends(active_user), db: Session = Depends(get_db)):
@@ -733,56 +724,121 @@ def register_feature_routes(
         ]
 
     def run_generation_job(db: Session, job: GenerationJob, user: User | None = None) -> GenerationJob:
+        db.refresh(job)
         work = db.get(Work, job.work_id)
-        if work is None or work.status == "TRASHED":
+        if job.status != "QUEUED":
+            return job
+        if work is None or work.status != "ACTIVE":
             job.status = "CANCELED"
             job.error_code = "WORK_TRASHED"
             job.finished_at = _now()
             return job
-        if job.status not in {"QUEUED", "RUNNING"}:
-            return job
         if work.revision != job.input_revision:
             job.status = "FAILED"
             job.error_code = "REVISION_CONFLICT"
-            job.error_message = "work changed after the generation request"
             job.finished_at = _now()
             return job
-        try:
-            _active_consent(db, work, job.consent_id, job.model_config_version_id)
-        except ValueError as exc:
-            job.status = "FAILED"
-            job.error_code = str(exc)
-            job.error_message = "external consent is no longer valid"
-            job.finished_at = _now()
-            return job
-        job.status = "RUNNING"
-        job.started_at = _now()
-        db.flush()
         config = db.get(ModelConfigVersion, job.model_config_version_id)
         provider = config.provider if config else None
-        if config is None or provider is None or not provider.enabled:
-            job.status = "FAILED"
-            job.error_code = "MODEL_CONFIG_NOT_AVAILABLE"
-            job.finished_at = _now()
-            return job
+        started = time.monotonic()
         try:
-            adapter = adapter_for(provider.adapter)
-            adapter_result = adapter.invoke(messages=[{"role": "user", "content": job.instruction or "generate"}], model=config.model_name, parameters=config.parameters_json or {})
-        except ModelAdapterError as exc:
-            job.status = "FAILED"
-            job.error_code = exc.code
-            job.error_message = str(exc)
+            requester = db.get(User, job.requested_by_user_id)
+            if requester is None or not requester.is_active:
+                raise ModelAdapterError("WORK_ACCESS_DENIED", "requesting account is unavailable")
+            _require(db, requester, work.id, {"OWNER", "EDITOR"})
+            consent = _active_consent(db, work, job.consent_id, job.model_config_version_id)
+            if "script" not in consent.data_categories_json:
+                raise ModelAdapterError("CONSENT_SCOPE_MISMATCH", "script transmission was not authorized")
+            validate_target(work, job.target_type, job.target_path_json)
+            messages = build_messages(db, work, consent, job.instruction or "生成剧本正文", target_type=job.target_type, target_path=job.target_path_json)
+            adapter = adapter_for(provider.adapter, endpoint=config.endpoint, credential=decrypt_secret(config.credential_ciphertext, app_settings.external_encryption_key))
+            model, parameters = config.model_name, deepcopy(config.parameters_json or {})
+            job.status = "RUNNING"
+            job.started_at = _now()
+            job_id = job.id
+            db.commit()
+            # Network I/O never holds a work/database lock.
+            db.rollback()
+            class CancelToken:
+                @property
+                def cancelled(self):
+                    if app.state.generation_worker.stopping.is_set():
+                        return True
+                    with app.state.session_factory() as state_db:
+                        record = state_db.get(GenerationJob, job_id)
+                        if record is None or record.status == "CANCELED":
+                            return True
+                        snapshot = state_db.get(Work, record.work_id)
+                        if snapshot is None or snapshot.status != "ACTIVE":
+                            return True
+                        if snapshot.revision != record.input_revision:
+                            raise ModelAdapterError("REVISION_CONFLICT", "work changed during generation")
+                        requester = state_db.get(User, record.requested_by_user_id)
+                        member = state_db.scalar(select(WorkMember).where(WorkMember.work_id == snapshot.id, WorkMember.user_id == record.requested_by_user_id, WorkMember.status == "ACCEPTED", WorkMember.role.in_(["OWNER", "EDITOR"])))
+                        if requester is None or not requester.is_active or member is None:
+                            raise ModelAdapterError("WORK_ACCESS_DENIED", "requesting account is unavailable")
+                        try:
+                            _active_consent(state_db, snapshot, record.consent_id, record.model_config_version_id)
+                        except ValueError as exc:
+                            raise ModelAdapterError(str(exc), "external consent is no longer valid") from None
+                        return False
+            result = None
+            for attempt in range(3):
+                try:
+                    token = CancelToken()
+                    check_cancel(token)
+                    result = adapter.invoke(messages=messages, model=model, parameters=parameters, timeout=app_settings.model_timeout_seconds, cancel_token=token)
+                    break
+                except ModelAdapterError as exc:
+                    if not exc.retryable or attempt == 2:
+                        raise
+                    if app.state.generation_worker.stopping.wait(0.25 * 2 ** attempt):
+                        raise ModelAdapterError("CANCELED", "generation worker is stopping")
+                    db.refresh(job)
+                    if job.status == "CANCELED":
+                        return job
+                    job.retry_count += 1
+                    db.commit()
+            db.expire_all()
+            job = db.get(GenerationJob, job_id)
+            work = db.scalar(select(Work).where(Work.id == job.work_id).with_for_update())
+            if job.status == "CANCELED" or work.status != "ACTIVE":
+                return job
+            if work.revision != job.input_revision:
+                raise ModelAdapterError("REVISION_CONFLICT", "work changed during generation")
+            requester = db.get(User, job.requested_by_user_id)
+            if not requester.is_active:
+                raise ModelAdapterError("WORK_ACCESS_DENIED", "requesting account is unavailable")
+            _require(db, requester, work.id, {"OWNER", "EDITOR"})
+            _active_consent(db, work, job.consent_id, job.model_config_version_id)
+            if result.stop_reason in {"length", "max_tokens"}:
+                raise ModelAdapterError("SCRIPT_STRUCTURE_INVALID", "model output was truncated")
+            content = replace_target(work, job.target_type, job.target_path_json, result.text)
+            claimed = db.execute(update(GenerationJob).where(GenerationJob.id == job.id, GenerationJob.status == "RUNNING").values(status="SUCCEEDED"))
+            if claimed.rowcount != 1:
+                db.rollback()
+                return db.get(GenerationJob, job.id)
+            invocation = ModelInvocationRecord(work_id=work.id, provider_id=provider.id, model_config_version_id=config.id, status="SUCCEEDED", usage_json=result.usage, duration_ms=int((time.monotonic() - started) * 1000), trace_id=uuid4().hex)
+            db.add(invocation)
+            version = _create_version(db, work, requester, content, "GENERATION", expected_revision=job.input_revision)
+            job.result_version_id = version.id
+            job.status = "SUCCEEDED"
             job.finished_at = _now()
-            return job
-        content = _target_content(work.draft_json or {}, job.target_type, job.target_path_json or {}, adapter_result.text)
-        trace_id = uuid4().hex
-        invocation = ModelInvocationRecord(work_id=work.id, provider_id=provider.id, model_config_version_id=config.id, status="SUCCEEDED", usage_json=adapter_result.usage, duration_ms=0, trace_id=trace_id)
-        db.add(invocation)
-        version = _create_version(db, work, user or db.get(User, job.requested_by_user_id), content, "GENERATION")
-        job.result_version_id = version.id
-        job.status = "SUCCEEDED"
-        job.finished_at = _now()
-        audit(db, "GENERATION_JOB_SUCCEEDED", actor=user, metadata={"work_id": work.id, "job_id": job.id, "version_id": version.id})
+            audit(db, "GENERATION_JOB_SUCCEEDED", actor=requester, metadata={"work_id": work.id, "job_id": job.id, "version_id": version.id})
+        except Exception as exc:
+            job_id = job.id
+            db.rollback()
+            job = db.get(GenerationJob, job_id)
+            if job is None:
+                return job
+            code = exc.code if isinstance(exc, ModelAdapterError) else str(exc) if isinstance(exc, ValueError) and str(exc).startswith("CONSENT_") else "WORK_ACCESS_DENIED" if getattr(exc, "status_code", None) == 403 else "REVISION_CONFLICT" if getattr(exc, "status_code", None) == 409 else "MODEL_CONFIG_NOT_AVAILABLE"
+            if job.status != "CANCELED":
+                job.status = "CANCELED" if code == "CANCELED" else "FAILED"
+                job.error_code = code
+                job.error_message = "generation did not complete; the previous draft is preserved"
+                job.finished_at = _now()
+            if provider and config:
+                db.add(ModelInvocationRecord(work_id=job.work_id, provider_id=provider.id, model_config_version_id=config.id, status=job.status, usage_json={}, duration_ms=int((time.monotonic() - started) * 1000), error_code=code, trace_id=uuid4().hex))
         return job
 
     @app.post("/api/v1/works/{work_id}/generation-jobs", response_model=GenerationJobResponse, status_code=status.HTTP_201_CREATED)
@@ -807,6 +863,12 @@ def register_feature_routes(
             consent = _active_consent(db, work, payload.consent_id, config_id)
         except ValueError as exc:
             raise error(str(exc), "external consent is no longer valid", status.HTTP_409_CONFLICT)
+        if "script" not in consent.data_categories_json:
+            raise error("CONSENT_SCOPE_MISMATCH", "script transmission was not authorized", status.HTTP_409_CONFLICT)
+        try:
+            validate_target(work, payload.target_type, payload.target_path)
+        except ModelAdapterError as exc:
+            raise error(exc.code, str(exc), status.HTTP_422_UNPROCESSABLE_CONTENT)
         config_id = config_id or consent.model_config_version_id
         active = db.scalar(select(GenerationJob).where(GenerationJob.work_id == work.id, GenerationJob.status.in_(["QUEUED", "RUNNING"])))
         if active is not None:
@@ -815,13 +877,18 @@ def register_feature_routes(
         if job.input_revision != work.revision:
             raise error("REVISION_CONFLICT", "generation input revision must match the current work revision", status.HTTP_409_CONFLICT)
         db.add(job)
-        db.flush()
-        running_global = db.scalar(select(GenerationJob.id).where(GenerationJob.status == "RUNNING").limit(app_settings.max_running_generation_jobs + 1))
-        can_run = running_global is None
-        if payload.auto_run and can_run:
-            run_generation_job(db, job, user)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            existing = db.scalar(select(GenerationJob).where(GenerationJob.work_id == work_id, GenerationJob.idempotency_key == idempotency_key))
+            if existing is not None:
+                return _job_response(existing)
+            raise error("GENERATION_ALREADY_RUNNING", "another generation job is active", status.HTTP_409_CONFLICT)
         audit(db, "GENERATION_JOB_CREATED", actor=user, metadata={"work_id": work.id, "job_id": job.id, "target_type": job.target_type})
         db.commit()
+        if payload.auto_run:
+            app.state.generation_worker.enqueue(job.id)
         return _job_response(job)
 
     @app.get("/api/v1/works/{work_id}/generation-jobs", response_model=list[GenerationJobResponse])
@@ -844,8 +911,10 @@ def register_feature_routes(
         job = db.scalar(select(GenerationJob).where(GenerationJob.id == job_id, GenerationJob.work_id == work.id))
         if job is None:
             raise error("GENERATION_JOB_NOT_FOUND", "generation job not found", status.HTTP_404_NOT_FOUND)
-        run_generation_job(db, job, user)
-        db.commit()
+        db.rollback()
+        with app.state.generation_worker.execution_lock:
+            run_generation_job(db, job, user)
+            db.commit()
         return _job_response(job)
 
     @app.post("/api/v1/works/{work_id}/generation-jobs/{job_id}/cancel", response_model=GenerationJobResponse)
@@ -857,9 +926,10 @@ def register_feature_routes(
             raise error("GENERATION_JOB_NOT_FOUND", "generation job not found", status.HTTP_404_NOT_FOUND)
         if job.status in {"SUCCEEDED", "FAILED", "CANCELED"}:
             raise error("GENERATION_JOB_NOT_ACTIVE", "generation job is already complete", status.HTTP_409_CONFLICT)
-        job.status = "CANCELED"
-        job.finished_at = _now()
-        job.error_code = "CANCELED_BY_USER"
+        changed = db.execute(update(GenerationJob).where(GenerationJob.id == job.id, GenerationJob.status.in_(["QUEUED", "RUNNING"])).values(status="CANCELED", finished_at=_now(), error_code="CANCELED_BY_USER"))
+        if changed.rowcount != 1:
+            raise error("GENERATION_JOB_NOT_ACTIVE", "generation job is already complete", status.HTTP_409_CONFLICT)
+        db.refresh(job)
         audit(db, "GENERATION_JOB_CANCELED", actor=user, metadata={"work_id": work.id, "job_id": job.id})
         db.commit()
         return _job_response(job)
@@ -877,12 +947,23 @@ def register_feature_routes(
             raise error("GENERATION_JOB_NOT_RETRYABLE", "this generation failure cannot be retried", status.HTTP_409_CONFLICT)
         if work.revision != job.input_revision:
             raise error("REVISION_CONFLICT", "work changed after the generation request", status.HTTP_409_CONFLICT)
+        if db.scalar(select(GenerationJob.id).where(GenerationJob.work_id == work.id, GenerationJob.id != job.id, GenerationJob.status.in_(["QUEUED", "RUNNING"]))):
+            raise error("GENERATION_ALREADY_RUNNING", "another generation job is active", status.HTTP_409_CONFLICT)
+        try:
+            _active_consent(db, work, job.consent_id, job.model_config_version_id)
+        except ValueError as exc:
+            raise error(str(exc), "external consent is no longer valid", status.HTTP_409_CONFLICT)
         job.status = "QUEUED"
         job.retry_count += 1
         job.error_code = None
         job.error_message = None
         job.finished_at = None
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise error("GENERATION_ALREADY_RUNNING", "another generation job is active", status.HTTP_409_CONFLICT)
+        app.state.generation_worker.enqueue(job.id)
         return _job_response(job)
 
     @app.post("/api/v1/works/{work_id}/exports", response_model=ExportJobResponse, status_code=status.HTTP_201_CREATED)
@@ -924,6 +1005,8 @@ def register_feature_routes(
             "format": 1,
             "created_at": _now().isoformat(),
             "users": [{"id": item.id, "username": item.username, "password_hash": item.password_hash, "role": item.role, "is_active": item.is_active, "must_change_password": item.must_change_password} for item in db.scalars(select(User)).all()],
+            "templates": [{"id": item.id, "slug": item.slug, "name": item.name, "status": item.status} for item in db.scalars(select(ScriptTemplate)).all()],
+            "template_versions": [{"id": item.id, "template_id": item.template_id, "version": item.version, "status": item.status, "definition": item.definition_json} for item in db.scalars(select(ScriptTemplateVersion)).all()],
             "works": [{"id": work.id, "title": work.title, "owner_id": work.owner_id, "template_version_id": work.template_version_id, "settings": work.settings_json, "status": work.status, "revision": work.revision, "draft": work.draft_json} for work in db.scalars(select(Work)).all()],
             "versions": [{"id": item.id, "work_id": item.work_id, "source": item.source, "author_user_id": item.author_user_id, "parent_version_id": item.parent_version_id, "content": item.content_json, "content_hash": item.content_hash, "work_revision": item.work_revision} for item in db.scalars(select(ScriptVersion)).all()],
             "releases": [{"id": item.id, "work_id": item.work_id, "version_id": item.version_id, "released_by_user_id": item.released_by_user_id, "is_current": item.is_current} for item in db.scalars(select(ScriptRelease)).all()],
@@ -965,8 +1048,29 @@ def register_feature_routes(
             if db.get(User, item.get("id")) is None and db.scalar(select(User).where(User.username == item.get("username"))) is None:
                 db.add(User(id=item["id"], username=item["username"], password_hash=item.get("password_hash", ""), role=item.get("role", "WRITER"), is_active=item.get("is_active", True), must_change_password=item.get("must_change_password", True)))
         db.flush()
-        # Restore durable work data. Runtime state such as sessions, queued jobs,
-        # consents and download links is never revived.
+        # Restore template bindings before works, including across fresh databases.
+        template_ids = {}
+        for item in snapshot.get("templates", []):
+            template = db.get(ScriptTemplate, item["id"]) or db.scalar(select(ScriptTemplate).where(ScriptTemplate.slug == item["slug"]))
+            if template is None:
+                template = ScriptTemplate(id=item["id"], slug=item["slug"], name=item["name"], status=item.get("status", "ACTIVE"))
+                db.add(template)
+            template_ids[item["id"]] = template.id
+        db.flush()
+        for item in snapshot.get("template_versions", []):
+            if db.get(ScriptTemplateVersion, item["id"]) is not None:
+                continue
+            template_id = template_ids.get(item["template_id"], item["template_id"])
+            template = db.get(ScriptTemplate, template_id)
+            if template is None:
+                continue
+            existing = db.scalars(select(ScriptTemplateVersion).where(ScriptTemplateVersion.template_id == template_id)).all()
+            number = max([version.version for version in existing] + [0]) + 1
+            state = "ARCHIVED" if existing else item.get("status", "ARCHIVED")
+            db.add(ScriptTemplateVersion(id=item["id"], template_id=template_id, version=number, status=state, definition_json=item["definition"]))
+            db.flush()
+        # Runtime state is never revived. Revisions advance to reject stale clients.
+        restored_work_ids = []
         for item in snapshot.get("works", []):
             work = db.get(Work, item["id"])
             if work is None and db.get(User, item.get("owner_id")) is not None:
@@ -976,7 +1080,11 @@ def register_feature_routes(
                 work.title = item.get("title", work.title)
                 work.settings_json = item.get("settings") or work.settings_json
                 work.status = item.get("status", work.status)
-                work.revision = item.get("revision", work.revision)
+                work.owner_id = item.get("owner_id", work.owner_id)
+                work.template_version_id = item.get("template_version_id", work.template_version_id)
+                work.revision = max(work.revision, item.get("revision", 0)) + 1
+                work.updated_at = _now()
+                restored_work_ids.append(work.id)
                 work.draft_json = item.get("draft") or {}
         db.flush()
         for item in snapshot.get("creative", []):
@@ -1011,17 +1119,36 @@ def register_feature_routes(
             if db.get(ScriptVersion, item["id"]) is None and db.get(Work, item.get("work_id")) is not None:
                 db.add(ScriptVersion(id=item["id"], work_id=item["work_id"], source=item.get("source", "RESTORE"), author_user_id=item.get("author_user_id"), parent_version_id=item.get("parent_version_id"), content_json=item.get("content") or {}, content_hash=item.get("content_hash") or _json_hash(item.get("content") or {}), work_revision=item.get("work_revision", 0)))
         db.flush()
+        for member in db.scalars(select(WorkMember).where(WorkMember.work_id.in_(restored_work_ids))).all():
+            member.status = "REVOKED"
+        db.flush()
         for item in snapshot.get("members", []):
             if db.get(User, item.get("user_id")) is None or db.get(Work, item.get("work_id")) is None:
                 continue
             member = db.scalar(select(WorkMember).where(WorkMember.work_id == item["work_id"], WorkMember.user_id == item["user_id"]))
             if member is None:
-                db.add(WorkMember(work_id=item["work_id"], user_id=item["user_id"], role=item.get("role", "VIEWER"), status=item.get("status", "ACCEPTED")))
+                member = WorkMember(work_id=item["work_id"], user_id=item["user_id"], role=item.get("role", "VIEWER"), status=item.get("status", "ACCEPTED"))
+                db.add(member)
+            member.role = item.get("role", "VIEWER")
+            member.status = item.get("status", "ACCEPTED")
+        db.flush()
+        for release in db.scalars(select(ScriptRelease).where(ScriptRelease.work_id.in_(restored_work_ids))).all():
+            release.is_current = False
         db.flush()
         for item in snapshot.get("releases", []):
             if db.get(ScriptRelease, item["id"]) is None and db.get(Work, item.get("work_id")) is not None and db.get(ScriptVersion, item.get("version_id")) is not None and db.get(User, item.get("released_by_user_id")) is not None:
                 db.add(ScriptRelease(id=item["id"], work_id=item["work_id"], version_id=item["version_id"], released_by_user_id=item["released_by_user_id"], is_current=item.get("is_current", False)))
+            else:
+                release = db.get(ScriptRelease, item["id"])
+                if release is not None:
+                    release.is_current = item.get("is_current", False)
         db.flush()
+        for item in snapshot.get("conversations", []):
+            if db.get(CreativeConversation, item["id"]) is None and db.get(Work, item["work_id"]) is not None and db.get(User, item["user_id"]) is not None:
+                db.add(CreativeConversation(id=item["id"], work_id=item["work_id"], user_id=item["user_id"], user_message=item["user_message"], assistant_message=item.get("assistant_message"), status=item.get("status", "SUCCEEDED")))
+        for export in db.scalars(select(ExportJob)).all():
+            export.download_token_hash = None
+            export.download_expires_at = _now()
         for job in db.scalars(select(GenerationJob).where(GenerationJob.status.in_(["QUEUED", "RUNNING"]))).all():
             job.status = "CANCELED"
             job.error_code = "RESTORE_RESET"
