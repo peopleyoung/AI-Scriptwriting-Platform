@@ -1,13 +1,13 @@
 import { demoTemplates, demoUser, sampleScript, seedWorks } from "./demo";
 import { stages } from "./types";
 import type {
-  Consent,
+  Message,
+  ContextOptions,
   Creative,
   Invitation,
   Model,
   NewWork,
   Proposal,
-  Provider,
   Script,
   Stage,
   Template,
@@ -28,11 +28,14 @@ const errorMessages: Record<string, string> = {
     "作品已有新修改。请重新打开作品后再操作；当前未保存内容仍保留在编辑区。",
   WORK_REVISION_CONFLICT: "作品已有新修改，请重新打开后再操作。",
   SETTINGS_NOT_CONFIRMED: "请先依次确认创作简报、人物与故事大纲。",
-  CONSENT_INVALID: "外发确认已失效，请重新确认。",
   WORK_ACCESS_DENIED: "你没有这部作品的操作权限。",
   CSRF_ORIGIN_REJECTED: "请求来源校验失败，请通过前端代理访问服务。",
   PROPOSAL_ALREADY_PENDING: "这项设定已有待审批提案。",
   GENERATION_ALREADY_RUNNING: "这部作品已有生成任务，请稍后再试。",
+  AI_ALREADY_RUNNING: "这部作品已有成员正在调用模型，请稍后再试。",
+  MODEL_CONFIG_NOT_AVAILABLE: "所选模型不可用，请重新选择模型。",
+  CONTEXT_BUDGET_EXCEEDED: "创作上下文过长，请缩小正文范围。",
+  INVALID_CONTEXT_TARGET: "请选择已保存的正文目标。",
   RELEASE_REQUIRED: "请先发布一个正式稿。",
   USER_NOT_FOUND: "该账号不存在，请确认登录名。",
   STAGE_ORDER_INVALID: "请按创作简报、人物、故事大纲的顺序确认。",
@@ -46,12 +49,12 @@ export class ApiError extends Error {
     super(message);
   }
 }
-export async function api<T>(
+async function apiResponse(
   path: string,
   method = "GET",
   body?: unknown,
   headers: Record<string, string> = {},
-): Promise<T> {
+): Promise<Response> {
   const csrf = document.cookie
     .split("; ")
     .find((item) => item.startsWith("scriptwriting_csrf="))
@@ -93,15 +96,17 @@ export async function api<T>(
       response.status,
     );
   }
+  return response;
+}
+export async function api<T>(path: string, method = "GET", body?: unknown, headers: Record<string, string> = {}): Promise<T> {
+  const response = await apiResponse(path, method, body, headers);
   return response.status === 204 ? (undefined as T) : response.json();
 }
 export class Studio {
   works: Work[] = [];
   templates: Template[] = [];
   invitations: Invitation[] = [];
-  private consents = new Map<string, Consent>();
   models: Model[] = [];
-  providers: Provider[] = [];
   constructor(
     public mode: "demo" | "live",
     public user: User = demoUser,
@@ -128,28 +133,15 @@ export class Studio {
       this.models = [
         {
           id: "demo-model",
-          provider_id: "demo-provider",
           model_name: "幕间创作助手（模拟）",
           version: 1,
           parameters: {},
         },
       ];
-      this.providers = [
-        {
-          id: "demo-provider",
-          name: "本地示例",
-          adapter: "mock",
-          retention_description: "所有交互仅在浏览器内模拟，不发送至外部模型。",
-          deletion_description:
-            "示例内容保存在当前浏览器，可在账户面板中重置。",
-          incident_description: "这是交互示例，不产生真实模型调用。",
-        },
-      ];
     } else {
-      [this.templates, this.models, this.providers] = await Promise.all([
+      [this.templates, this.models] = await Promise.all([
         api<Template[]>("/templates"),
         api<Model[]>("/model-configs"),
-        api<Provider[]>("/providers"),
       ]);
       const [works, trash, invitations] = await Promise.all([
         api<Partial<Work>[]>("/works"),
@@ -397,53 +389,59 @@ export class Studio {
     }
     return this.finish(work, approve);
   }
-  async grantConsent(id: string, modelId: string): Promise<Consent> {
-    const work = this.work(id);
-    const data_categories = ["conversation", "settings", "outline", "script"];
-    if (this.mode === "live")
-      return api(`/works/${id}/consents`, "POST", {
-        model_config_version_id: modelId,
-        input_revision: work.revision,
-        data_categories,
-      });
-    const consent = {
-      id: uid(),
-      input_revision: work.revision,
-      model_config_version_id: modelId,
-      data_categories,
-      status: "ACTIVE",
-    };
-    this.consents.set(id, consent);
-    return consent;
+  async availableModels() {
+    if (this.mode === "live") this.models = await api<Model[]>("/model-configs");
+    return this.models;
   }
-  async existingConsent(
-    id: string,
-    modelId: string,
-  ): Promise<Consent | undefined> {
-    if (this.mode === "demo") {
-      const consent = this.consents.get(id);
-      return consent?.input_revision === this.work(id).revision &&
-        consent.model_config_version_id === modelId
-        ? consent
-        : undefined;
-    }
-    const consents = await api<Consent[]>(`/works/${id}/consents`);
-    return consents.find(
-      (c) =>
-        c.status === "ACTIVE" &&
-        c.input_revision === this.work(id).revision &&
-        c.model_config_version_id === modelId &&
-        ["conversation", "settings", "outline", "script"].every((category) =>
-          c.data_categories.includes(category),
-        ),
-    );
+  async activity(id: string) {
+    if (this.mode === "demo") return null;
+    return api<Work["ai_activity"]>(`/works/${id}/ai-activity`);
   }
-  async chat(id: string, message: string, consent: Consent) {
+  async conversations(id: string) {
+    return this.mode === "live" ? api<Message[]>(`/works/${id}/conversations`) : this.work(id).conversations;
+  }
+  async previewContext(id: string, message: string, options: ContextOptions) {
+    if (this.mode === "demo") return { script_scope: options.include_full_script ? "WORK" : options.target_type || "NONE", history_pairs: this.work(id).conversations.length, history_limit: 12, characters: 0, character_budget: 60000 };
+    return api<Record<string, unknown>>(`/works/${id}/conversation-context`, "POST", { message: message || " ", ...options });
+  }
+  async stopChat(id: string, conversationId: string) {
+    if (this.mode === "live") await api(`/works/${id}/conversations/${conversationId}/stop`, "POST");
+  }
+  async chat(id: string, message: string, options: ContextOptions, onMessage: (message: Message) => void, signal: AbortSignal) {
     if (this.mode === "live") {
-      await api(`/works/${id}/conversations`, "POST", {
-        message,
-        consent_id: consent.id,
+      const response = await apiResponse(`/works/${id}/conversations/stream`, "POST", {
+        message, ...options, idempotency_key: uid(),
       });
+      const reader = response.body!.getReader();
+      const abort = () => { void reader.cancel(); };
+      signal.addEventListener("abort", abort, { once: true });
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let terminal = false;
+      try {
+        if (signal.aborted) abort();
+        while (!signal.aborted) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let end;
+          while ((end = buffer.indexOf("\n\n")) >= 0) {
+            const event = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+            const data = event.split("\n").find((line) => line.startsWith("data: "));
+            if (!data) continue;
+            const row = JSON.parse(data.slice(6)) as Message;
+            onMessage(row);
+            if (!["QUEUED", "RUNNING"].includes(row.status || "")) {
+              terminal = true;
+              if (row.status !== "SUCCEEDED" && row.status !== "STOPPED") throw new Error("对话未完成，已保留部分回复。可手动重试。");
+            }
+          }
+        }
+        if (!terminal && !signal.aborted) throw new Error("连接中断，已保存的部分回复会保留。可手动重试。");
+      } finally {
+        signal.removeEventListener("abort", abort);
+        await reader.cancel().catch(() => undefined);
+      }
       return this.refresh(id);
     }
     await new Promise((resolve) => setTimeout(resolve, 800));
@@ -453,12 +451,9 @@ export class Studio {
       : /悬念|冲突|重写/.test(message)
         ? "建议让信息比对白慢一步出现。\n\n角色说“没见过”，手却下意识护住旧照片；角色想要离开，门外偏偏传来熟悉的声音。用一个可见的动作制造矛盾，再让下一场景回答它。\n\n你可以选中正文的一个片段，使用“重写片段”来体验这个流程。"
         : "这个方向可以从“人物的选择”展开。\n\n先给主角一个清晰的目标，再设置一个必须付出代价才能跨越的障碍。每一集解决一个小问题，同时留下一个更大的疑问。\n\n我们可以先把这个想法写入创作简报，再依次完善人物与故事大纲。";
-    work.conversations.push({
-      id: uid(),
-      user_message: message,
-      assistant_message: reply,
-      created_at: now(),
-    });
+    const row: Message = { id: uid(), user_message: message, assistant_message: reply, created_at: now(), status: signal.aborted ? "STOPPED" : "SUCCEEDED", model_display_name: "幕间创作助手（模拟）", model_version: 1 };
+    onMessage(row);
+    work.conversations = [...work.conversations.filter((m) => m.id !== row.id), row];
     return this.finish(work);
   }
   async generate(
@@ -468,7 +463,7 @@ export class Studio {
     scene: number,
     fragment: string,
     instruction: string,
-    consent: Consent,
+    modelConfigVersionId: string,
     onJob?: (id: string) => void,
   ) {
     const work = this.work(id);
@@ -488,8 +483,7 @@ export class Studio {
               ? { episode, scene }
               : { episode, scene, fragment },
         instruction,
-        consent_id: consent.id,
-        model_config_version_id: consent.model_config_version_id,
+        model_config_version_id: modelConfigVersionId,
         expected_revision: work.revision,
         input_revision: work.revision,
         idempotency_key: uid(),
@@ -737,7 +731,6 @@ export class Studio {
   }
   resetDemo() {
     this.works = seedWorks();
-    this.consents.clear();
     this.persist();
   }
 }

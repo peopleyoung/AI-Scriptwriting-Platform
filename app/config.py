@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     max_running_generation_jobs_per_user: int = 1
     max_running_generation_jobs_per_provider: int = 1
     model_timeout_seconds: float = 120
+    creative_context_max_characters: int = 60000
     frontend_dist: str | None = None
 
     @model_validator(mode="after")

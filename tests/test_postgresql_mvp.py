@@ -30,12 +30,9 @@ def test_postgresql_migrations_concurrent_jobs_and_cancellation(monkeypatch):
         _login(client, username, 'Postgres-password-123')
         work=client.post('/api/v1/works',json={'title':'PostgreSQL smoke'}).json()['id']
         _confirm_all(client,work)
-        provider=client.post('/api/v1/admin/providers',json={'slug':username,'name':'mock','adapter':'mock','retention_description':'local','deletion_description':'test','incident_description':'test'}).json()['id']
-        client.patch(f'/api/v1/admin/providers/{provider}',json={'enabled':True})
-        config=client.post('/api/v1/admin/model-configs',json={'provider_id':provider,'model_name':'mock'}).json()['id']
-        authorization=client.post(f'/api/v1/works/{work}/consents',json={'model_config_version_id':config,'data_categories':['script']}).json()['id']
+        config=client.post('/api/v1/admin/model-configs',json={'adapter':'mock','model_name':'mock'}).json()['id']
         def create(key):
-            return client.post(f'/api/v1/works/{work}/generation-jobs',json={'consent_id':authorization,'target_type':'EPISODE','target_path':{'episode':1},'idempotency_key':key})
+            return client.post(f'/api/v1/works/{work}/generation-jobs',json={'model_config_version_id':config,'target_type':'EPISODE','target_path':{'episode':1},'idempotency_key':key})
         with ThreadPoolExecutor(max_workers=2) as pool:
             responses=list(pool.map(create, ['a','b']))
         assert sorted(response.status_code for response in responses)==[201,409]

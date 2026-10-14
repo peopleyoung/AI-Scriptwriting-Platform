@@ -61,17 +61,14 @@ def test_versions_are_immutable_and_export_reads_release(tmp_path: Path) -> None
         assert "版本测试" in download.text
 
 
-def test_generation_requires_consent_and_creates_version(tmp_path: Path) -> None:
+def test_direct_generation_creates_version(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         assert client.post("/api/v1/admin/bootstrap", json={"username": "admin", "password": "Admin-password-123"}).status_code == 201
         _login(client, "admin", "Admin-password-123")
         work_id = client.post("/api/v1/works", json={"title": "生成测试"}).json()["id"]
         _confirm_all(client, work_id)
-        provider = client.post("/api/v1/admin/providers", json={"slug": "mock", "name": "Mock", "adapter": "mock", "retention_description": "r", "deletion_description": "d", "incident_description": "i"}).json()
-        assert client.patch(f"/api/v1/admin/providers/{provider['id']}", json={"enabled": True}).status_code == 200
-        config = client.post("/api/v1/admin/model-configs", json={"provider_id": provider["id"], "model_name": "mock"}).json()
-        consent = client.post(f"/api/v1/works/{work_id}/consents", json={"model_config_version_id": config["id"], "data_categories": ["script"]}).json()
-        queued = client.post(f"/api/v1/works/{work_id}/generation-jobs", json={"consent_id": consent["id"], "model_config_version_id": config["id"], "idempotency_key": "one", "instruction": "写一个片段"})
+        config = client.post("/api/v1/admin/model-configs", json={"adapter": "mock", "model_name": "mock"}).json()
+        queued = client.post(f"/api/v1/works/{work_id}/generation-jobs", json={"model_config_version_id": config["id"], "idempotency_key": "one", "instruction": "写一个片段"})
         assert queued.status_code == 201
         assert queued.json()["status"] == "QUEUED"
         done = client.post(f"/api/v1/works/{work_id}/generation-jobs/{queued.json()['id']}/run")

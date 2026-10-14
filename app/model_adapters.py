@@ -1,10 +1,13 @@
 """Provider HTTP contracts. Provider bodies and credentials never enter errors."""
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable
+from threading import Event, Thread
+from queue import Empty, Full, Queue
 from urllib.parse import urlsplit
 
 import httpx
@@ -42,12 +45,13 @@ class BaseModelAdapter:
         raise NotImplementedError
 
     def stream(self, **kwargs: Any) -> Iterable[str]:
-        yield self.invoke(**kwargs).text
+        self.last_response = self.invoke(**kwargs)
+        yield self.last_response.text
 
     def classify_error(self, error: Exception) -> ModelAdapterError:
         if isinstance(error, ModelAdapterError):
             return error
-        if isinstance(error, httpx.TimeoutException):
+        if isinstance(error, (httpx.TimeoutException, TimeoutError)):
             return ModelAdapterError("TIMEOUT", "model request timed out", retryable=True)
         if isinstance(error, httpx.TransportError):
             return ModelAdapterError("TRANSIENT_PROVIDER_ERROR", "model provider connection failed", retryable=True)
@@ -106,32 +110,74 @@ class HTTPModelAdapter(BaseModelAdapter):
         settings.pop("messages", None)
         settings.pop("model", None)
         settings.pop("stream", None)
+        settings.pop("system", None)
         payload = self.build_request(messages=messages, model=model, parameters=settings)
         payload["stream"] = streaming
-        deadline = time.monotonic() + (timeout or 120)
+        url, headers = self._url(), self._headers()
+        events = Queue(maxsize=32)
+        ready, finished = Event(), Event()
+        running, failures = {}, []
+
+        async def publish(event):
+            # Bound memory without blocking the event loop or its cancellation.
+            while True:
+                try:
+                    events.put_nowait(event)
+                    return
+                except Full:
+                    await asyncio.sleep(.01)
+
+        async def receive():
+            running.update(loop=asyncio.get_running_loop(), task=asyncio.current_task())
+            ready.set()
+            try:
+                # Async cancellation closes the socket even during connect,
+                # request upload, or waiting for the first response header.
+                async with asyncio.timeout(timeout or 120):
+                    async with httpx.AsyncClient(transport=self.transport, timeout=timeout or 120, follow_redirects=False) as client:
+                        async with client.stream('POST', url, json=payload, headers=headers) as response:
+                            self._check_status(response)
+                            if not streaming:
+                                raw = bytearray()
+                                async for chunk in response.aiter_bytes():
+                                    raw.extend(chunk)
+                                    if len(raw) > 4 * 1024 * 1024:
+                                        raise ModelAdapterError('INVALID_PROVIDER_RESPONSE', 'model response is too large')
+                                await publish(json.loads(raw))
+                            else:
+                                async for line in response.aiter_lines():
+                                    if line.startswith('data:'):
+                                        value = line[5:].strip()
+                                        if value == '[DONE]':
+                                            return
+                                        if value:
+                                            await publish(json.loads(value))
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                failures.append(self.classify_error(exc))
+            finally:
+                finished.set()
+
+        reader = Thread(target=lambda: asyncio.run(receive()), name='mujian-model-http', daemon=True)
+        reader.start()
         try:
-            with httpx.Client(transport=self.transport, timeout=timeout or 120, follow_redirects=False) as client:
-                with client.stream("POST", self._url(), json=payload, headers=self._headers()) as response:
-                    self._check_status(response)
-                    if not streaming:
-                        raw = response.read()
-                        if len(raw) > 4 * 1024 * 1024:
-                            raise ModelAdapterError("INVALID_PROVIDER_RESPONSE", "model response is too large")
-                        check_cancel(cancel_token)
-                        yield json.loads(raw)
-                        return
-                    for line in response.iter_lines():
-                        check_cancel(cancel_token)
-                        if time.monotonic() > deadline:
-                            raise ModelAdapterError("TIMEOUT", "model request timed out", retryable=True)
-                        if line.startswith("data:"):
-                            value = line[5:].strip()
-                            if value == "[DONE]":
-                                return
-                            if value:
-                                yield json.loads(value)
-        except (httpx.HTTPError, ValueError, TypeError) as exc:
-            raise self.classify_error(exc) from None
+            while not finished.is_set() or not events.empty():
+                check_cancel(cancel_token)
+                try:
+                    yield events.get(timeout=.05)
+                except Empty:
+                    continue
+            check_cancel(cancel_token)
+            if failures:
+                raise failures[0]
+        finally:
+            if ready.wait(1) and not finished.is_set():
+                try:
+                    running['loop'].call_soon_threadsafe(running['task'].cancel)
+                except RuntimeError:
+                    pass  # The response finished as cancellation arrived.
+            reader.join(timeout=2)
 
     def invoke(self, *, messages: list[dict[str, str]], model: str, parameters: dict[str, Any] | None = None, timeout: float | None = None, cancel_token: Any = None) -> AdapterResponse:
         # Streaming allows cancellation between provider events and captures usage.
@@ -171,14 +217,41 @@ class HTTPModelAdapter(BaseModelAdapter):
         result = "".join(text)
         if not result.strip():
             raise ModelAdapterError("EMPTY_MODEL_RESPONSE", "model returned no text")
+        if streaming and not stop:
+            raise ModelAdapterError("INCOMPLETE_MODEL_RESPONSE", "model response did not finish")
         if stop in {"content_filter", "refusal"}:
             raise ModelAdapterError("CONTENT_POLICY_ERROR", "model declined this request")
         usage = {key: value for key, value in usage.items() if key in {"input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"} and isinstance(value, int) and not isinstance(value, bool) and value >= 0}
         return AdapterResponse(result, stop, usage)
 
     def stream(self, **kwargs: Any) -> Iterable[str]:
-        for event in self._request(parameters=kwargs.pop("parameters", None), timeout=kwargs.pop("timeout", None), cancel_token=kwargs.pop("cancel_token", None), streaming=True, **kwargs):
-            yield from self.parse_stream([event])
+        parameters = kwargs.pop("parameters", None)
+        timeout = kwargs.pop("timeout", None)
+        token = kwargs.pop("cancel_token", None)
+        size, stop, usage = 0, None, {}
+        for event in self._request(parameters=parameters, timeout=timeout, cancel_token=token, streaming=True, **kwargs):
+            if not isinstance(event, dict) or event.get("type") == "error" or event.get("error"):
+                raise ModelAdapterError("INVALID_PROVIDER_RESPONSE", "model interrupted the response")
+            choices = event.get("choices") or []
+            if any((choice.get("delta") or {}).get("refusal") for choice in choices):
+                raise ModelAdapterError("CONTENT_POLICY_ERROR", "model declined this request")
+            stop = event.get("delta", {}).get("stop_reason") or (choices[0].get("finish_reason") if choices else None) or stop
+            usage.update(event.get("usage") or event.get("message", {}).get("usage") or {})
+            for chunk in self.parse_stream([event]):
+                check_cancel(token)
+                size += len(chunk)
+                if size > 4 * 1024 * 1024:
+                    raise ModelAdapterError("INVALID_PROVIDER_RESPONSE", "model response is too large")
+                yield chunk
+        check_cancel(token)
+        if not size:
+            raise ModelAdapterError("EMPTY_MODEL_RESPONSE", "model returned no text")
+        if not stop or stop in {"length", "max_tokens"}:
+            raise ModelAdapterError("INCOMPLETE_MODEL_RESPONSE", "model response did not finish")
+        if stop in {"content_filter", "refusal"}:
+            raise ModelAdapterError("CONTENT_POLICY_ERROR", "model declined this request")
+        usage = {key: value for key, value in usage.items() if key in {"input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens"} and isinstance(value, int) and not isinstance(value, bool) and value >= 0}
+        self.last_response = AdapterResponse("", stop, usage)
 
 
 class OpenAICompatibleAdapter(HTTPModelAdapter):

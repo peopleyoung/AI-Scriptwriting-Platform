@@ -15,6 +15,8 @@
 | 7 | 协作工作区和导出 | 6 | 三栏工作区、进度、版本比较/恢复、正式稿、Markdown/DOCX |
 | 8 | 备份、安全与验收 | 7 | 加密备份、恢复演练、脱敏、权限/并发/合约测试 |
 
+2026-10-13 核查发现现有代码没有前端页面，不能以旧任务勾选替代 UI 交付。新增页面设计及必要接口补齐按[前端任务包](../.scratch/frontend-experience/spec.md)执行，详细方案见[前端开发方案](frontend-development-plan.md)；新增规则以 ADR 0007-0010 为准。
+
 ## 统一完成条件
 
 - 遵守 `docs/development-design.md` 的数据、权限、状态机和 API 约束。

@@ -15,4 +15,8 @@ with TemporaryDirectory(prefix="mujian-e2e-") as directory:
     from app.config import Settings
     from app.main import create_app
 
-    uvicorn.run(create_app(Settings(database_url=os.environ["APP_DATABASE_URL"], backup_dir=os.environ["APP_BACKUP_DIR"], bootstrap_admin_username=None, bootstrap_admin_password=None, bootstrap_secret=None, cookie_secure=False)), host="127.0.0.1", port=8015, log_level="warning")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
+    from http_model_server import model_server
+
+    with model_server(8016):
+        uvicorn.run(create_app(Settings(database_url=os.environ["APP_DATABASE_URL"], backup_dir=os.environ["APP_BACKUP_DIR"], bootstrap_admin_username=None, bootstrap_admin_password=None, bootstrap_secret=None, cookie_secure=False)), host="127.0.0.1", port=8015, log_level="warning")

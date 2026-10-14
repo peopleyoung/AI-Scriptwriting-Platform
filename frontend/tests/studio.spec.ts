@@ -50,7 +50,7 @@ async function login(page: Page, username: string, initial = false) {
   }
   await expect(
     page.getByRole("heading", { name: "今天，又有什么故事想说？" }),
-  ).toBeVisible();
+  ).toBeVisible({ timeout: 15000 });
 }
 
 test("专注写作：草稿、版本、正式稿与片段重写", async ({ page }) => {
@@ -112,10 +112,7 @@ test("专注写作：草稿、版本、正式稿与片段重写", async ({ page 
   await page.getByRole("button", { name: "重写选中片段" }).click();
   await expect(
     page.getByRole("dialog", { name: "确认本次创作的发送范围" }),
-  ).toBeVisible();
-  await expect(page.getByRole("button", { name: "确认并继续" })).toBeDisabled();
-  await page.getByRole("checkbox").check();
-  await page.getByRole("button", { name: "确认并继续" }).click();
+  ).toHaveCount(0);
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(block).toHaveValue(/铜铃响了/);
   const storage = await page.evaluate(() =>
@@ -180,8 +177,6 @@ test("未保存保护、刷新恢复、设定变更审批、深色与手机", as
   await page.getByRole("button", { name: "创作对话", exact: true }).click();
   await page.getByLabel("创作对话内容").fill("探索人物的动机");
   await page.getByRole("button", { name: "发送创作对话" }).click();
-  await page.getByRole("checkbox").check();
-  await page.getByRole("button", { name: "确认并继续" }).click();
   await expect(
     page.locator(".chat-user").getByText("探索人物的动机", { exact: true }),
   ).toBeVisible();
@@ -209,20 +204,8 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
       username,
       password: "Browser-password-123",
     });
-  const provider = await api(request, "/admin/providers", "POST", {
-    slug: "browsermock",
-    name: "浏览器测试模型",
-    adapter: "mock",
-    retention_description: "不外发",
-    deletion_description: "临时数据库",
-    incident_description: "模拟测试",
-  });
-  await api(request, `/admin/providers/${provider.id}`, "PATCH", {
-    enabled: true,
-  });
   await api(request, "/admin/model-configs", "POST", {
-    provider_id: provider.id,
-    model_name: "mock",
+    display_name: "浏览器测试模型", model_name: "normal-browser", base_url: "http://127.0.0.1:8016/v1", api_key: "browser-test-key",
   });
   await login(page, "browserowner", true);
   await page
@@ -271,18 +254,16 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
   await page.getByRole("button", { name: "回到写作", exact: true }).click();
   await page.getByLabel("创作对话内容").fill("人物应该怎样出场？");
   await page.getByRole("button", { name: "发送创作对话" }).click();
-  await page.getByRole("checkbox").check();
-  await page.getByRole("button", { name: "确认并继续" }).click();
   await expect(
-    page.getByText("已记录创作讨论：人物应该怎样出场？"),
+    page.getByText("第一段回复，第二段完成。", { exact: true }),
   ).toBeVisible();
   await block.fill("草稿新修改");
   await page.getByLabel("创作对话内容").fill("第二轮讨论");
   await page.getByRole("button", { name: "发送创作对话" }).click();
   await expect(
     page.getByRole("dialog", { name: "确认本次创作的发送范围" }),
-  ).toBeVisible();
-  await page.getByRole("button", { name: "取消", exact: true }).click();
+  ).toHaveCount(0);
+  await expect(page.locator(".chat-assistant").last()).toContainText("第二段完成");
   await expect(block).toHaveValue("草稿新修改");
   await page.getByRole("button", { name: "版本", exact: true }).click();
   await page.getByRole("button", { name: "恢复此版本" }).click();
@@ -298,8 +279,6 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
     .getByRole("button", { name: "生成本集", exact: true })
     .last()
     .click();
-  await page.getByRole("checkbox").check();
-  await page.getByRole("button", { name: "确认并继续" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.locator(".toast")).toContainText("生成完成");
   expect(await api(page.request, `/works/${workId}/versions`)).toHaveLength(3);
@@ -410,7 +389,7 @@ test("作品首页：搜索筛选、动态模板字段、回收站恢复及手�
   await screenshot(page, "works-mobile");
 });
 
-test("管理员界面配置账号、供应商、模型、模板和加密备份", async ({
+test("管理员界面配置账号、独立模型、模板和加密备份", async ({
   page,
   request,
 }) => {
@@ -447,31 +426,32 @@ test("管理员界面配置账号、供应商、模型、模板和加密备份",
   await writer.getByRole("button", { name: "停用", exact: true }).click();
   await expect(writer).toContainText("停用");
   await writer.getByRole("button", { name: "启用", exact: true }).click();
-  await page.getByRole("button", { name: "模型供应商", exact: true }).click();
-  await page.getByRole("button", { name: "新建模型供应商" }).click();
-  await page.getByLabel("供应商名称").fill("界面测试供应商");
-  await page.getByLabel("供应商标识").fill("ui-mock");
-  await page.getByLabel("接口类型").selectOption("mock");
-  await page.getByLabel("数据保留说明").fill("本地测试，不向外部发送");
-  await page.getByLabel("数据删除说明").fill("测试后清理临时数据库");
-  await page.getByLabel("故障与重试说明").fill("最多重试两次");
-  await page
-    .getByLabel("API 密钥（留空保持现有凭证）")
-    .fill("not-a-real-secret");
-  await page.getByRole("button", { name: "保存配置", exact: true }).click();
-  await page
-    .locator(".job-row")
-    .filter({ hasText: "界面测试供应商" })
-    .getByRole("button", { name: "启用", exact: true })
-    .click();
+  await expect(page.getByRole("button", { name: "模型供应商", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "模型配置", exact: true }).click();
-  await page.getByRole("button", { name: "新建模型配置" }).click();
-  await page.getByLabel("模型供应商").selectOption({ label: "界面测试供应商" });
-  await page.getByLabel("模型标识").fill("ui-test-model");
+  for (const suffix of ["A", "B"]) {
+    await page.getByRole("button", { name: "新建模型配置" }).click();
+    await page.getByLabel("显示名称", { exact: true }).fill(`界面模型 ${suffix}`);
+    await expect(page.getByLabel("接口类型")).toHaveValue("openai");
+    await page.getByLabel("模型标识").fill(`ui-model-${suffix}`);
+    await page.getByLabel("base_url（留空使用官方默认地址）").fill("http://127.0.0.1:8999/v1");
+    await page.getByLabel("API key（留空保持现有密钥）").fill("not-a-real-secret");
+    await page.getByRole("button", { name: "保存配置", exact: true }).click();
+  }
+  const modelA = page.locator(".job-row").filter({ hasText: "界面模型 A" });
+  const modelB = page.locator(".job-row").filter({ hasText: "界面模型 B" });
+  await expect(modelA).toContainText("ACTIVE");
+  await expect(modelB).toContainText("ACTIVE");
+  await modelB.getByRole("button", { name: "编辑", exact: true }).click();
+  await expect(page.getByLabel("API key（留空保持现有密钥）")).toHaveValue("");
+  await page.getByLabel("显示名称", { exact: true }).fill("界面模型 B 新版");
+  await page.getByLabel("接口类型").selectOption("anthropic");
   await page.getByRole("button", { name: "保存配置", exact: true }).click();
-  await expect(
-    page.locator(".job-row").filter({ hasText: "ui-test-model" }),
-  ).toContainText("ACTIVE");
+  const newest = page.locator(".job-row").filter({ hasText: "界面模型 B 新版" });
+  await expect(newest).toContainText("v2");
+  await expect(modelA).toContainText("ACTIVE");
+  await newest.getByRole("button", { name: "停用", exact: true }).click();
+  await expect(newest.getByRole("button", { name: "启用", exact: true })).toBeVisible();
+  await expect(modelA.getByRole("button", { name: "停用", exact: true })).toBeVisible();
   await page
     .getByRole("button", { name: "剧本模板", exact: true })
     .last()
@@ -523,8 +503,6 @@ test("自动保存不创建版本，作品参数与场景生成可操作", async
   await page.getByLabel("生成范围").selectOption("SCENE");
   await page.getByLabel("创作方向").fill("生成一个安静的场景");
   await page.getByRole("button", { name: "生成场景", exact: true }).click();
-  await page.getByRole("checkbox").check();
-  await page.getByRole("button", { name: "确认并继续" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.locator(".toast")).toContainText("生成完成");
   const after = await page.evaluate(() =>

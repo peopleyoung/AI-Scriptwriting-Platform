@@ -254,7 +254,7 @@ export default function Home({
             ? "一个画面，一句对白，一个还没成形的念头。让我们从这里开始。"
             : page === "team"
               ? "让好的故事，在共同创作中发生。"
-              : "作品保留 30 天。恢复后需重新确认外发授权。"}
+              : "作品保留 30 天，所有者可在此恢复。"}
         </p>
       </div>
       {page === "works" && (
@@ -545,7 +545,7 @@ export default function Home({
           }
         >
           <p>
-            《{deleting.title}》进入回收站后，协作者无法访问，外发确认失效。
+            《{deleting.title}》进入回收站后，协作者无法访问，未完成的模型调用将停止。
           </p>
           <ErrorMessage message={error} />
         </Modal>

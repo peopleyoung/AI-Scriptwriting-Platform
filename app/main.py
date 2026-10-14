@@ -24,6 +24,8 @@ from app.models import (
     WorkMember,
 )
 from app.features import invalidate_work_external_state, register_feature_routes
+from app.creative_calls import cancel_calls, ensure_editable, finish_conversation, release
+from app.model_adapters import ModelAdapterError
 from app.schemas import (
     AuditResponse,
     BootstrapRequest,
@@ -466,6 +468,13 @@ def _require_work_member(
     return work, member
 
 
+def _ensure_work_editable(db, work_id):
+    try:
+        ensure_editable(db, work_id)
+    except ModelAdapterError as exc:
+        raise _error(exc.code, str(exc), 409)
+
+
 def _work_response(work: Work) -> WorkResponse:
     return WorkResponse(
         id=work.id,
@@ -624,12 +633,15 @@ async def lifespan(app: FastAPI):
                 db.commit()
     worker = app.state.generation_worker
     with app.state.session_factory() as db:
-        from app.models import GenerationJob
+        from app.models import GenerationJob, CreativeConversation, WorkAIActivity
         # Interrupted requests require a fresh explicit retry; queued work resumes.
         for job in db.scalars(select(GenerationJob).where(GenerationJob.status == "RUNNING")).all():
             job.status = "FAILED"
             job.error_code = "WORKER_INTERRUPTED"
             job.finished_at = datetime.now(timezone.utc)
+            release(db, job.work_id, job.id)
+        for row in db.scalars(select(CreativeConversation).where(CreativeConversation.status.in_(["QUEUED", "RUNNING"]))).all():
+            finish_conversation(db, row, "INCOMPLETE", "WORKER_INTERRUPTED")
         queued_ids = list(db.scalars(select(GenerationJob.id).where(GenerationJob.status == "QUEUED")))
         db.commit()
     worker.start()
@@ -639,6 +651,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         worker.stop()
+        with app.state.session_factory() as db:
+            cancel_calls(db, code="SERVER_STOPPED")
+            db.commit()
         app.state.engine.dispose()
 
 
@@ -855,6 +870,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> WorkResponse:
         _check_csrf(request)
         work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        _ensure_work_editable(db, work.id)
         incoming_settings = payload.get("settings", payload) if isinstance(payload, dict) else payload
         expected = _expected_revision(request, payload)
         if expected is not None and expected != work.revision:
@@ -916,6 +932,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _check_csrf(request)
         stage = _normalize_stage(stage)
         work, _ = _require_work_member(db, user, work_id, {"OWNER", "EDITOR"})
+        _ensure_work_editable(db, work.id)
         expected = _expected_revision(request, payload)
         if expected is not None and expected != work.revision:
             raise _error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
@@ -954,6 +971,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _check_csrf(request)
         stage = _normalize_stage(stage)
         work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        _ensure_work_editable(db, work.id)
         expected = _expected_revision(request)
         if expected is not None and expected != work.revision:
             raise _error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
@@ -994,6 +1012,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _check_csrf(request)
         stage = _normalize_stage(payload.stage)
         work, _ = _require_work_member(db, user, work_id, {"OWNER", "EDITOR"})
+        _ensure_work_editable(db, work.id)
         data = _creative_data(work)
         if getattr(data, f"{stage}_confirmed_json") is None:
             raise _error("SETTING_NOT_CONFIRMED", "only confirmed settings can have change proposals", status.HTTP_409_CONFLICT)
@@ -1048,6 +1067,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> ChangeProposalResponse:
         _check_csrf(request)
         work, _ = _require_work_member(db, owner, work_id, {"OWNER"})
+        _ensure_work_editable(db, work.id)
         proposal = db.scalar(
             select(ChangeProposal).where(ChangeProposal.id == proposal_id, ChangeProposal.work_id == work.id)
         )
@@ -1211,6 +1231,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise _error("MEMBER_NOT_FOUND", "member not found", status.HTTP_404_NOT_FOUND)
         if member.status == "REVOKED":
             raise _error("MEMBER_NOT_FOUND", "member not found", status.HTTP_404_NOT_FOUND)
+        cancel_calls(db, work_id=work.id, user_id=member.user_id, code="WORK_ACCESS_DENIED")
         member.status = "REVOKED"
         member.revoked_at = datetime.now(timezone.utc)
         _audit(
@@ -1244,6 +1265,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if member is None or member.role == "OWNER":
             raise _error("MEMBER_NOT_FOUND", "member not found", status.HTTP_404_NOT_FOUND)
         old_role = member.role
+        if payload.role == "VIEWER":
+            cancel_calls(db, work_id=work.id, user_id=member.user_id, code="WORK_ACCESS_DENIED")
         member.role = payload.role
         _audit(
             db,
@@ -1389,6 +1412,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.commit()
         response.delete_cookie(app_settings.session_cookie_name, path="/")
         response.delete_cookie(app_settings.csrf_cookie_name, path="/")
+        response.status_code = status.HTTP_204_NO_CONTENT
         return response
 
     @app.get("/api/v1/auth/me", response_model=UserResponse)
@@ -1460,6 +1484,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             active_admins = db.scalars(select(User.id).where(User.role == "ADMIN", User.is_active.is_(True))).all()
             if len(active_admins) <= 1:
                 raise _error("LAST_ADMIN_FORBIDDEN", "the last active administrator cannot be disabled", status.HTTP_400_BAD_REQUEST)
+        if not payload.active:
+            cancel_calls(db, user_id=target.id, code="WORK_ACCESS_DENIED")
         target.is_active = payload.active
         if not payload.active:
             now = datetime.now(timezone.utc)

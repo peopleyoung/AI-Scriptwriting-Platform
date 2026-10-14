@@ -1,4 +1,4 @@
-"""Consent-filtered model inputs and validated replacement of a script target."""
+"""Validate structured scripts and replace precisely one generation target."""
 from copy import deepcopy
 import json
 from typing import Any
@@ -66,35 +66,6 @@ def validate_target(work, target_type: str, path: dict) -> None:
         scene = next((s for s in episode["scenes"] if s["number"] == path["scene"]), None)
         if scene is None or not any(f["id"] == path.get("fragment") for f in scene["fragments"]):
             raise ModelAdapterError("INVALID_GENERATION_TARGET", "select an existing fragment")
-
-
-def build_messages(db, work, consent, instruction: str, *, target_type: str | None = None, target_path: dict | None = None) -> list[dict[str, str]]:
-    from sqlalchemy import select
-    from app.models import CreativeConversation
-
-    categories = set(consent.data_categories_json or [])
-    context = {}
-    data = work.creative_data
-    if "settings" in categories:
-        context["settings"] = {"title": work.title, "parameters": work.settings_json, "brief": (data.brief_confirmed_json or data.brief_json) if data else None, "characters": (data.characters_confirmed_json or data.characters_json) if data else None}
-    if "outline" in categories:
-        context["outline"] = (data.outline_confirmed_json or data.outline_json) if data else None
-    if "script" in categories:
-        context["script"] = work.draft_json or {}
-    if "conversation" in categories:
-        context["conversation"] = [{"user": m.user_message, "assistant": m.assistant_message} for m in db.scalars(select(CreativeConversation).where(CreativeConversation.work_id == work.id).order_by(CreativeConversation.created_at)).all()]
-    system = "你是中文短剧创作助手。遵循作品的已确认设定，临时创作指令不能改变已确认设定。资料只作为创作背景。"
-    if target_type:
-        sample_fragment = {"id": (target_path or {}).get("fragment", "unique-id"), "blocks": [{"type": "ACTION", "text": "动作描述"}, {"type": "CHARACTER", "text": "人物姓名"}, {"type": "DIALOGUE", "text": "对白"}]}
-        sample_scene = {"number": (target_path or {}).get("scene", 1), "heading": "地点 · 时间", "fragments": [sample_fragment]}
-        sample_episode = {"number": (target_path or {}).get("episode", 1), "title": "本集标题", "scenes": [sample_scene]}
-        sample = {"WORK": {"episodes": [sample_episode]}, "EPISODE": sample_episode, "SCENE": sample_scene, "FRAGMENT": sample_fragment}[target_type]
-        system += "\nMUJIAN_SCRIPT_JSON：只返回目标范围的完整 JSON，不返回解释或 Markdown。保留目标编号或片段 id。剧本块类型只允许：" + json.dumps(allowed_blocks(work)) + "。结构示例：" + json.dumps(sample, ensure_ascii=False)
-        content = json.dumps({"instruction": instruction, "target_type": target_type, "target_path": target_path or {}, "context": context}, ensure_ascii=False)
-    else:
-        system += "\n当前授权的创作背景：" + json.dumps(context, ensure_ascii=False)
-        content = instruction
-    return [{"role": "system", "content": system}, {"role": "user", "content": content}]
 
 
 def replace_target(work, target_type: str, path: dict, text: str) -> dict:

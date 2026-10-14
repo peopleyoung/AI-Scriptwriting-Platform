@@ -246,12 +246,24 @@ class ModelProvider(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class ModelConfiguration(Base):
+    """Stable identity and availability; invocation settings live in immutable versions."""
+    __tablename__ = "model_configurations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class ModelConfigVersion(Base):
     __tablename__ = "model_config_versions"
-    __table_args__ = (UniqueConstraint("provider_id", "version", name="uq_model_config_provider_version"),)
+    __table_args__ = (UniqueConstraint("model_id", "version", name="uq_model_config_identity_version"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     provider_id: Mapped[str] = mapped_column(ForeignKey("model_providers.id", ondelete="CASCADE"), nullable=False, index=True)
+    model_id: Mapped[str | None] = mapped_column(ForeignKey("model_configurations.id", ondelete="RESTRICT"), nullable=True, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    adapter: Mapped[str | None] = mapped_column(String(32), nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     model_name: Mapped[str] = mapped_column(String(256), nullable=False)
     endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -262,6 +274,7 @@ class ModelConfigVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     provider: Mapped["ModelProvider"] = relationship()
+    model: Mapped["ModelConfiguration | None"] = relationship()
 
 
 class ExternalConsent(Base):
@@ -281,7 +294,7 @@ class ExternalConsent(Base):
 
 class CreativeConversation(Base):
     __tablename__ = "creative_conversations"
-    __table_args__ = (Index("ix_creative_conversations_work_created", "work_id", "created_at"),)
+    __table_args__ = (Index("ix_creative_conversations_work_created", "work_id", "created_at"), UniqueConstraint("work_id", "idempotency_key", name="uq_conversations_idempotency"))
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     work_id: Mapped[str] = mapped_column(ForeignKey("works.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -290,6 +303,23 @@ class CreativeConversation(Base):
     assistant_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="SUCCEEDED", nullable=False)
     invocation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    model_config_version_id: Mapped[str | None] = mapped_column(ForeignKey("model_config_versions.id", ondelete="RESTRICT"), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    input_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    config: Mapped["ModelConfigVersion | None"] = relationship()
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class WorkAIActivity(Base):
+    __tablename__ = "work_ai_activities"
+
+    work_id: Mapped[str] = mapped_column(ForeignKey("works.id", ondelete="CASCADE"), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    reference_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -326,7 +356,8 @@ class GenerationJob(Base):
     target_path_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     instruction: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_config_version_id: Mapped[str] = mapped_column(ForeignKey("model_config_versions.id", ondelete="RESTRICT"), nullable=False)
-    consent_id: Mapped[str] = mapped_column(ForeignKey("external_consents.id", ondelete="RESTRICT"), nullable=False)
+    consent_id: Mapped[str | None] = mapped_column(ForeignKey("external_consents.id", ondelete="RESTRICT"), nullable=True)
+    input_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="QUEUED", nullable=False, index=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)

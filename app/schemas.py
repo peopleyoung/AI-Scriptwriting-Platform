@@ -256,85 +256,47 @@ class ScriptReleaseResponse(BaseModel):
     version: ScriptVersionResponse
 
 
-class ProviderCreateRequest(BaseModel):
-    slug: str = Field(min_length=1, max_length=128)
-    name: str = Field(min_length=1, max_length=256)
-    adapter: Literal["openai", "anthropic", "mock"] = "mock"
-    retention_description: str | None = None
-    deletion_description: str | None = None
-    incident_description: str | None = None
-    credential: str | None = None
-
-
-class ProviderUpdateRequest(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=256)
-    retention_description: str | None = None
-    deletion_description: str | None = None
-    incident_description: str | None = None
-    enabled: bool | None = None
-    credential: str | None = None
-
-
-class ProviderResponse(BaseModel):
-    id: str
-    slug: str
-    name: str
-    adapter: str
-    enabled: bool
-    retention_description: str | None
-    deletion_description: str | None
-    incident_description: str | None
-    created_at: datetime
-    updated_at: datetime
-
-
 class ModelConfigCreateRequest(BaseModel):
-    provider_id: str
+    display_name: str | None = Field(default=None, min_length=1, max_length=256)
+    adapter: Literal["openai", "anthropic", "mock"] = "openai"
+    enabled: bool = True
+    base_url: str | None = None
+    api_key: str | None = Field(default=None, min_length=1)
     model_name: str = Field(min_length=1, max_length=256)
-    endpoint: str | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
-    credential: str | None = None
 
 
 class ModelConfigUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=256)
+    adapter: Literal["openai", "anthropic", "mock"] | None = None
+    enabled: bool | None = None
+    base_url: str | None = None
+    api_key: str | None = Field(default=None, min_length=1)
     model_name: str | None = Field(default=None, min_length=1, max_length=256)
-    endpoint: str | None = None
     parameters: dict[str, Any] | None = None
-    credential: str | None = None
 
 
 class ModelConfigResponse(BaseModel):
     id: str
-    provider_id: str
+    model_id: str
+    display_name: str
+    adapter: str
+    enabled: bool
+    base_url: str | None
     version: int
     model_name: str
-    endpoint: str | None
     parameters: dict[str, Any]
     status: str
     created_at: datetime
 
 
-class ConsentCreateRequest(BaseModel):
-    model_config_version_id: str
-    data_categories: list[Literal["conversation", "settings", "outline", "script"]] = Field(min_length=1)
-    input_revision: int | None = None
-
-
-class ConsentResponse(BaseModel):
-    id: str
-    work_id: str
-    input_revision: int
-    model_config_version_id: str
-    data_categories: list[str]
-    status: str
-    granted_by_user_id: str
-    created_at: datetime
-    revoked_at: datetime | None
-
-
 class ConversationRequest(BaseModel):
     message: str = Field(min_length=1, max_length=10000)
-    consent_id: str
+    model_config_version_id: str
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=256)
+    target_type: Literal["EPISODE", "SCENE", "FRAGMENT"] | None = None
+    target_path: dict[str, Any] = Field(default_factory=dict)
+    include_full_script: bool = False
 
 
 class ConversationResponse(BaseModel):
@@ -345,6 +307,13 @@ class ConversationResponse(BaseModel):
     assistant_message: str | None
     status: str
     invocation_id: str | None
+    model_config_version_id: str | None = None
+    model_id: str | None = None
+    model_display_name: str | None = None
+    model_version: int | None = None
+    input_revision: int | None = None
+    context_summary: dict[str, Any] | None = None
+    error_code: str | None = None
     created_at: datetime
 
 
@@ -352,8 +321,7 @@ class GenerationJobRequest(BaseModel):
     target_type: Literal["WORK", "EPISODE", "SCENE", "FRAGMENT"] = "WORK"
     target_path: dict[str, Any] = Field(default_factory=dict)
     instruction: str | None = Field(default=None, max_length=10000)
-    consent_id: str
-    model_config_version_id: str | None = None
+    model_config_version_id: str
     input_revision: int | None = None
     expected_revision: int | None = None
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=256)
@@ -366,6 +334,8 @@ class GenerationJobResponse(BaseModel):
     requested_by_user_id: str
     idempotency_key: str
     input_revision: int
+    model_config_version_id: str
+    context_summary: dict[str, Any] | None = None
     target_type: str
     target_path: dict[str, Any]
     status: str

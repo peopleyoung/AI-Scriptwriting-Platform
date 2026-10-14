@@ -77,6 +77,12 @@ export interface Message {
   user_message: string;
   assistant_message: string | null;
   created_at: string;
+  status?: string;
+  model_config_version_id?: string | null;
+  model_display_name?: string | null;
+  model_version?: number | null;
+  context_summary?: Record<string, unknown> | null;
+  input_revision?: number | null;
 }
 export interface Proposal {
   id: string;
@@ -116,6 +122,7 @@ export interface Work {
   conversations: Message[];
   proposals: Proposal[];
   members: Member[];
+  ai_activity?: { kind: string; id: string; user_id: string } | null;
   template_definition?: Definition;
 }
 export interface Template {
@@ -126,25 +133,20 @@ export interface Template {
 }
 export interface Model {
   id: string;
-  provider_id: string;
   model_name: string;
   version: number;
   parameters: Record<string, unknown>;
+  model_id?: string;
+  display_name?: string;
+  adapter?: string;
+  enabled?: boolean;
+  base_url?: string | null;
 }
-export interface Provider {
-  id: string;
-  name: string;
-  adapter: string;
-  retention_description: string | null;
-  deletion_description: string | null;
-  incident_description: string | null;
-}
-export interface Consent {
-  id: string;
-  input_revision: number;
+export interface ContextOptions {
   model_config_version_id: string;
-  data_categories: string[];
-  status: string;
+  include_full_script?: boolean;
+  target_type?: "EPISODE" | "SCENE" | "FRAGMENT";
+  target_path?: { episode?: number; scene?: number; fragment?: string };
 }
 export interface NewWork {
   title: string;

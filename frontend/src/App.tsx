@@ -215,7 +215,7 @@ export default function App() {
             }}
             onRestore={async (work) => {
               update(await studio.trash(work.id, true));
-              notify("作品已恢复，请重新确认外发授权。");
+              notify("作品已恢复，可继续创作。");
             }}
             onAccept={async (id) => {
               await studio.acceptInvitation(id);

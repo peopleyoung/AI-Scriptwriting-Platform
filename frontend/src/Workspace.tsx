@@ -27,7 +27,8 @@ import {
   roleNames,
   stageNames,
   stages,
-  type Consent,
+  type ContextOptions,
+  type Message,
   type Episode,
   type Fragment,
   type Page,
@@ -120,7 +121,6 @@ export default function Workspace({
     | "generate"
     | "jobs"
     | "parameters"
-    | "consent"
     | null
   >(null);
   const [stage, setStage] = useState<Stage>("brief");
@@ -134,9 +134,27 @@ export default function Workspace({
     "EPISODE",
   );
   const [generationScene, setGenerationScene] = useState(1);
-  const [modelId, setModelId] = useState(studio.models[0]?.id || "");
-  const [pending, setPending] = useState<Intent | null>(null);
-  const [checked, setChecked] = useState(false);
+  const [models, setModels] = useState(studio.models);
+  const preferenceKey = `mujian-model:${studio.mode}:${studio.user.id}:${work.id}`;
+  const [modelId, setModelId] = useState(() => localStorage.getItem(preferenceKey) || models[0]?.model_id || models[0]?.id || "");
+  const [includeFullScript, setIncludeFullScript] = useState(() => localStorage.getItem(`${preferenceKey}:full-script`) === "1");
+  const [contextTarget, setContextTarget] = useState<"NONE" | "EPISODE" | "SCENE" | "FRAGMENT">("NONE");
+  const [contextSummary, setContextSummary] = useState<Record<string, unknown> | null>(null);
+  const [contextError, setContextError] = useState("");
+  const [chatBusy, setChatBusy] = useState(false);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [activity, setActivity] = useState(work.ai_activity);
+  const chatLock = useRef(false);
+  const chatAbort = useRef<AbortController | null>(null);
+  const chosenModel = models.find((m) => (m.model_id || m.id) === modelId);
+  const aiBusy = chatBusy || Boolean(activity);
+  const contextOptions: ContextOptions = {
+    model_config_version_id: chosenModel?.id || "",
+    include_full_script: includeFullScript,
+    ...(contextTarget !== "NONE" ? { target_type: contextTarget,
+      target_path: { episode: episodeNumber, ...(contextTarget !== "EPISODE" ? { scene: selected?.scene || generationScene } : {}), ...(contextTarget === "FRAGMENT" ? { fragment: selected?.fragment } : {}) } } : {}),
+  };
+
   const [versionId, setVersionId] = useState(work.versions.at(-1)?.id || "");
   const [compareId, setCompareId] = useState("");
   const [releaseId, setReleaseId] = useState(
@@ -167,7 +185,7 @@ export default function Workspace({
   const disabled =
     busy ||
     Boolean(activeJob) ||
-    modal === "consent" ||
+    activity?.kind === "GENERATION" ||
     sessionExpired ||
     Boolean(conflict);
   const episodes = draft.episodes || [];
@@ -189,9 +207,6 @@ export default function Workspace({
     ) || 0;
   const selectedVersion = work.versions.find((v) => v.id === versionId);
   const comparison = work.versions.find((v) => v.id === compareId);
-  const provider = studio.providers.find(
-    (p) => p.id === studio.models.find((m) => m.id === modelId)?.provider_id,
-  );
   const scriptDefinition = work.template_definition?.script_structure as
     | { blocks?: string[] }
     | undefined;
@@ -224,8 +239,38 @@ export default function Workspace({
   }, [dirty]);
   useEffect(() => {
     chatEnd.current?.scrollIntoView({ block: "nearest" });
-  }, [work.conversations.length, busy]);
+  }, [work.conversations, busy]);
+  useEffect(() => { if (modelId) localStorage.setItem(preferenceKey, modelId); }, [modelId, preferenceKey]);
+  useEffect(() => { localStorage.setItem(`${preferenceKey}:full-script`, includeFullScript ? "1" : "0"); }, [includeFullScript, preferenceKey]);
 
+  useEffect(() => () => { chatAbort.current?.abort(); }, []);
+  useEffect(() => {
+    let disposed = false;
+    const timer = setTimeout(() => {
+      void studio.previewContext(work.id, message, contextOptions).then((summary) => {
+        if (!disposed) { setContextSummary(summary); setContextError(""); }
+      }).catch((err) => { if (!disposed) setContextError(err.message); });
+    }, 200);
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [work.revision, work.conversations.length, message, includeFullScript, contextTarget, episodeNumber, selected, generationScene, chosenModel?.id]);
+  useEffect(() => {
+    if (studio.mode !== "live") return;
+    let disposed = false;
+    async function pollActivity() {
+      try {
+        const [next, available] = await Promise.all([studio.activity(work.id), studio.availableModels()]);
+        if (disposed) return;
+        setActivity(next); setModels(available);
+        if (!chatLock.current) {
+          const rows = await studio.conversations(work.id);
+          if (!disposed) apply({ ...current.current, conversations: rows });
+        }
+      } catch { /* Send and save report authorization errors without losing input. */ }
+    }
+    void pollActivity();
+    const timer = setInterval(() => { void pollActivity(); }, 900);
+    return () => { disposed = true; clearInterval(timer); };
+  }, [work.id]);
   function apply(next: Work, replaceDraft = false) {
     current.current = next;
     onUpdate(next);
@@ -393,6 +438,10 @@ export default function Workspace({
       if (target) mutator(target);
     });
   }
+  function selectFragment(scene: number, fragment: string) {
+    setSelected({ scene, fragment });
+    setContextTarget("FRAGMENT");
+  }
   function addEpisode() {
     const number = Math.max(0, ...episodes.map((e) => e.number)) + 1;
     change((next) => {
@@ -410,75 +459,65 @@ export default function Workspace({
   function selectEpisode(number: number) {
     setEpisodeNumber(number);
     setSelected(null);
+    setContextTarget("EPISODE");
     setMobilePane("paper");
     editorRef.current?.scrollTo({ top: 0 });
   }
-  async function execute(intent: Intent, consent: Consent) {
-    if (intent.kind === "chat") {
-      apply(await studio.chat(work.id, intent.instruction, consent));
-      setMessage("");
-      notify("创作对话已记录。");
-    } else {
-      setModal(null);
-      setPending(null);
-      try {
-        apply(
-          await studio.generate(
-            work.id,
-            intent.kind,
-            intent.episode,
-            intent.scene,
-            intent.fragment,
-            intent.instruction,
-            consent,
-            setActiveJob,
-          ),
-          true,
-        );
-        setSelected(null);
-        setEpisodeNumber(intent.episode);
-        notify("生成完成，已保留整部作品版本。");
-      } finally {
-        setActiveJob(null);
-      }
-    }
-    setPending(null);
-    setModal(null);
-    setInstruction("");
-  }
   async function requestAI(intent: Intent) {
-    if (!modelId) {
-      setError("暂无可用模型，请联系管理员配置模型，或继续手动写作。");
-      return;
-    }
-    if (intent.kind !== "chat" && confirmedCount < 3) {
-      setModal("settings");
-      setError("请先依次确认三个创作阶段。");
-      return;
-    }
-    if (intent.kind !== "chat" && !intent.instruction.trim()) {
-      setError("请填写生成或修改方向。");
-      return;
-    }
+    if (intent.kind === "chat") return;
+    if (!chosenModel) { setError("所选模型不可用，请重新选择模型；仍可继续手动写作。"); return; }
+    if (aiBusy) { setError("作品已有成员正在调用模型，当前输入已保留。"); return; }
+    if (confirmedCount < 3) { setModal("settings"); setError("请先依次确认三个创作阶段。"); return; }
+    if (!intent.instruction.trim()) { setError("请填写生成或修改方向。"); return; }
+    const configId = chosenModel.id;
     await run(async () => {
-      const consent = await studio.existingConsent(work.id, modelId);
-      if (consent) await execute(intent, consent);
-      else {
-        setPending(intent);
-        setChecked(false);
-        setModal("consent");
-      }
+      setModal(null);
+      try {
+        apply(await studio.generate(work.id, intent.kind as "EPISODE" | "SCENE" | "FRAGMENT", intent.episode, intent.scene, intent.fragment, intent.instruction, configId, setActiveJob), true);
+        setSelected(null); setEpisodeNumber(intent.episode); setInstruction("");
+        notify("生成完成，已保留整部作品版本。");
+      } finally { setActiveJob(null); }
     });
   }
-  async function sendMessage() {
-    if (message.trim() && editable)
-      await requestAI({
-        kind: "chat",
-        instruction: message.trim(),
-        episode: episodeNumber,
-        scene: 0,
-        fragment: "",
-      });
+  async function sendMessage(retryText?: string) {
+    const text = retryText || message.trim();
+    if (!text || !editable || chatLock.current) return;
+    if (!chosenModel) { setError("所选模型不可用，请重新选择模型；仍可继续手动写作。"); return; }
+    if (aiBusy) { setError("作品已有成员正在调用模型，当前输入已保留。"); return; }
+    chatLock.current = true;
+    const options = structuredClone(contextOptions);
+    const saved = await run(async () => {}, true);
+    if (!saved) { chatLock.current = false; return; }
+    const placeholderId = `local-${crypto.randomUUID()}`;
+    const placeholder: Message = { id: placeholderId, user_message: text, assistant_message: null, created_at: new Date().toISOString(), status: "RUNNING", model_display_name: chosenModel.display_name || chosenModel.model_name, model_version: chosenModel.version };
+    apply({ ...current.current, conversations: [...current.current.conversations, placeholder] });
+    setChatBusy(true); setMessage(""); setError("");
+    const controller = new AbortController(); chatAbort.current = controller;
+    let received = false;
+    try {
+      const next = await studio.chat(work.id, text, options, (row) => {
+        received = true;
+        setActiveChatId(row.status === "RUNNING" ? row.id : null);
+        const previous = current.current.conversations;
+        apply({ ...current.current, conversations: [...previous.filter((m) => m.id !== row.id && m.id !== placeholderId), row] });
+      }, controller.signal);
+      apply(next);
+    } catch (err) {
+      if (!received) apply({ ...current.current, conversations: current.current.conversations.filter((m) => m.id !== placeholderId) });
+      if (!controller.signal.aborted) {
+        setError(err instanceof Error ? err.message : "对话未完成，可手动重试。");
+        setMessage((value) => value || text);
+      }
+    } finally {
+      setChatBusy(false); setActiveChatId(null); chatLock.current = false; chatAbort.current = null;
+      void studio.activity(work.id).then(setActivity).catch(() => undefined);
+    }
+  }
+  async function stopChat() {
+    try {
+      if (activeChatId) await studio.stopChat(work.id, activeChatId);
+      chatAbort.current?.abort();
+    } catch (err) { setError(err instanceof Error ? err.message : "停止失败。"); }
   }
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -770,7 +809,7 @@ export default function Workspace({
                     setInstruction("");
                     openModal("generate");
                   }}
-                  disabled={disabled || !studio.models.length}
+                  disabled={disabled || !models.length}
                 >
                   <Sparkles />
                   {selected ? "重写片段" : "生成本集"}
@@ -824,6 +863,11 @@ export default function Workspace({
                       </span>
                       <input
                         aria-label={`场景 ${scene.number} 标题`}
+                        onFocus={() => {
+                          setSelected(null);
+                          setGenerationScene(scene.number);
+                          setContextTarget("SCENE");
+                        }}
                         placeholder="地点 · 时间 · 氛围"
                         value={scene.heading || ""}
                         disabled={disabled}
@@ -841,12 +885,8 @@ export default function Workspace({
                       <div
                         className={`script-fragment ${selected?.scene === scene.number && selected.fragment === fragment.id ? "selected" : ""}`}
                         key={fragment.id}
-                        onClick={() =>
-                          setSelected({
-                            scene: scene.number,
-                            fragment: fragment.id,
-                          })
-                        }
+                        onClick={() => selectFragment(scene.number, fragment.id)}
+                        onFocus={() => selectFragment(scene.number, fragment.id)}
                       >
                         <div className="fragment-label">
                           <span>
@@ -1069,9 +1109,12 @@ export default function Workspace({
                   <div className="chat-assistant">
                     <span>
                       <Sparkles size={13} />
-                      幕间创作助手
+                      {m.model_display_name || "幕间创作助手"}{m.model_version ? ` · v${m.model_version}` : ""}
                     </span>
-                    <p>{m.assistant_message || "回复尚未完成。"}</p>
+                    <p>{m.assistant_message || (m.status === "RUNNING" ? "正在等待模型回复…" : "回复尚未完成。")}</p>
+                    {m.status && m.status !== "SUCCEEDED" && <small role="status">{m.status === "RUNNING" ? "正在回复" : m.status === "STOPPED" ? "已停止" : "未完成"}</small>}
+                    {m.status && ["FAILED", "INCOMPLETE", "STOPPED"].includes(m.status) && editable && <Button small disabled={aiBusy || disabled || !chosenModel} onClick={() => { void sendMessage(m.user_message); }}>重试对话</Button>}
+                    {m.context_summary && <details><summary>本次上下文</summary><p>正文范围：{String(m.context_summary.script_scope)} · 历史 {String(m.context_summary.history_pairs)} 轮 · 发送时修订 {String(m.input_revision ?? "历史记录")}</p></details>}
                   </div>
                 </div>
               ))}
@@ -1106,6 +1149,18 @@ export default function Workspace({
                 disabled={!editable || disabled}
                 onChange={(event) => setMessage(event.target.value)}
               />
+              <label className="checkbox-row"><input type="checkbox" checked={includeFullScript} onChange={(e) => setIncludeFullScript(e.target.checked)} disabled={!editable} />包含整部正文</label>
+              <Field label="对话正文范围"><select value={contextTarget} onChange={(e) => setContextTarget(e.target.value as typeof contextTarget)} disabled={!editable || includeFullScript}>
+                <option value="NONE">不附带正文</option><option value="EPISODE">当前集</option><option value="SCENE">当前场景</option><option value="FRAGMENT">所选片段</option>
+              </select></Field>
+              <details className="context-summary"><summary>查看创作上下文范围</summary><p>当前消息、创作设定、故事大纲；最近最多 12 轮完整对话。已停止和未完成回复不纳入。</p>
+                <p>正文：{includeFullScript ? "整部正文" : contextTarget === "NONE" ? "不附带正文" : `第 ${episodeNumber} 集${contextTarget !== "EPISODE" ? ` · 场景 ${selected?.scene || generationScene}` : ""}${contextTarget === "FRAGMENT" ? ` · 片段 ${selected?.fragment || "未选中"}` : ""}`}</p>
+                {contextSummary && <p>历史 {String(contextSummary.history_pairs)} 轮 · 预计 {String(contextSummary.characters)} / {String(contextSummary.character_budget)} 字符。发送前保存当前修改。</p>}
+                <ErrorMessage message={contextError} />
+              </details>
+              {activity && !chatBusy && <p role="status">作品已有成员正在{activity.kind === "GENERATION" ? "生成正文" : "进行创作对话"}，当前输入已保留。</p>}
+              {!chosenModel && <p role="status">所选模型不可用，请重新选择；仍可继续手动写作。</p>}
+              {chatBusy && <Button onClick={() => { void stopChat(); }}>停止回复</Button>}
               <div className="row between">
                 <select
                   aria-label="创作模型"
@@ -1113,20 +1168,21 @@ export default function Workspace({
                   onChange={(event) => setModelId(event.target.value)}
                   disabled={disabled || !editable}
                 >
-                  {!studio.models.length && (
+                  {modelId && !chosenModel && <option value={modelId}>所选模型不可用，请重新选择</option>}
+                  {!models.length && (
                     <option value="">暂无可用模型</option>
                   )}
-                  {studio.models.map((m) => (
-                    <option value={m.id} key={m.id}>
-                      {m.model_name} · v{m.version}
+                  {models.map((m) => (
+                    <option value={m.model_id || m.id} key={m.id}>
+                      {m.display_name || m.model_name} · v{m.version}
                     </option>
                   ))}
                 </select>
                 <IconButton
                   label="发送创作对话"
-                  onClick={sendMessage}
+                  onClick={() => { void sendMessage(); }}
                   disabled={
-                    disabled || !editable || !message.trim() || !modelId
+                    disabled || aiBusy || !editable || !message.trim() || !chosenModel
                   }
                 >
                   <Send />
@@ -1135,7 +1191,7 @@ export default function Workspace({
               <p className="chat-disclaimer">
                 {studio.mode === "demo"
                   ? "本地示例回复 · 不调用外部模型"
-                  : "使用所选模型进行创作 · 每轮需要有效外发确认"}
+                : "使用所选模型进行创作 · 当前消息、设定和近期对话将用于本次请求"}
               </p>
             </div>
           </aside>
@@ -1267,7 +1323,7 @@ export default function Workspace({
                           apply(
                             await studio.reviewProposal(work.id, p.id, true),
                           );
-                          notify("提案已接受，外发确认需要重新授权。");
+                          notify("提案已接受，请检查下游设定的确认状态。");
                         })
                       }
                       disabled={busy}
@@ -1405,9 +1461,9 @@ export default function Workspace({
               onChange={(event) => setModelId(event.target.value)}
               disabled={busy}
             >
-              {studio.models.map((m) => (
+              {models.map((m) => (
                 <option key={m.id} value={m.id}>
-                  {m.model_name} · v{m.version}
+                  {m.display_name || m.model_name} · v{m.version}
                 </option>
               ))}
             </select>
@@ -1417,94 +1473,6 @@ export default function Workspace({
               ? "本次生成会遵循已确认设定。"
               : "请先依次确认三个创作阶段。"}
           </p>
-          <ErrorMessage message={error} />
-        </Modal>
-      )}
-      {modal === "consent" && pending && (
-        <Modal
-          title="确认本次创作的发送范围"
-          description="授权仅适用于当前作品输入和所选模型配置版本。"
-          onClose={() => {
-            setModal(null);
-            setPending(null);
-          }}
-          busy={busy}
-          footer={
-            <>
-              <Button
-                onClick={() => {
-                  setModal(null);
-                  setPending(null);
-                }}
-                disabled={busy}
-              >
-                取消
-              </Button>
-              {owner && (
-                <Button
-                  primary
-                  disabled={!checked || busy}
-                  onClick={() =>
-                    run(
-                      async () =>
-                        execute(
-                          pending,
-                          await studio.grantConsent(work.id, modelId),
-                        ),
-                      false,
-                    )
-                  }
-                >
-                  确认并继续
-                </Button>
-              )}
-            </>
-          }
-        >
-          <div className="consent-summary">
-            <div>
-              <span>供应商</span>
-              <strong>{provider?.name || "未知供应商"}</strong>
-            </div>
-            <div>
-              <span>模型</span>
-              <strong>
-                {studio.models.find((m) => m.id === modelId)?.model_name} · v
-                {studio.models.find((m) => m.id === modelId)?.version}
-              </strong>
-            </div>
-            <div>
-              <span>作品输入</span>
-              <strong>当前修订 {work.revision}</strong>
-            </div>
-            <div>
-              <span>发送范围</span>
-              <strong>创作对话、设定、故事大纲、剧本正文</strong>
-            </div>
-          </div>
-          <div className="provider-policy">
-            <h3>数据保留</h3>
-            <p>{provider?.retention_description || "供应商未提供说明。"}</p>
-            <h3>数据删除</h3>
-            <p>{provider?.deletion_description || "供应商未提供说明。"}</p>
-            <h3>故障处理</h3>
-            <p>{provider?.incident_description || "供应商未提供说明。"}</p>
-          </div>
-          {owner ? (
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={checked}
-                onChange={(event) => setChecked(event.target.checked)}
-                disabled={busy}
-              />
-              <span>我了解发送范围，允许使用当前输入进行本次创作。</span>
-            </label>
-          ) : (
-            <div className="notice">
-              只有作品所有者可以授权外发。请联系所有者为当前作品输入与所选模型进行确认。
-            </div>
-          )}
           <ErrorMessage message={error} />
         </Modal>
       )}
@@ -1978,7 +1946,7 @@ export default function Workspace({
       {modal === "parameters" && (
         <Modal
           title="作品参数"
-          description="更新参数后，已有外发确认失效。"
+          description="后续创作将使用更新后的作品参数。"
           busy={busy}
           onClose={() => setModal("settings")}
           footer={

@@ -12,17 +12,15 @@ type Row = Record<string, unknown> & {
     version: number;
   }[];
 };
-type Tab = "users" | "providers" | "models" | "templates" | "operations";
+type Tab = "users" | "models" | "templates" | "operations";
 const names: Record<Tab, string> = {
   users: "账号管理",
-  providers: "模型供应商",
   models: "模型配置",
   templates: "剧本模板",
   operations: "审计与备份",
 };
 const paths = {
   users: "/admin/users",
-  providers: "/admin/providers",
   models: "/admin/model-configs",
   templates: "/admin/templates",
 };
@@ -40,7 +38,6 @@ export default function Admin({
 }) {
   const [tab, setTab] = useState<Tab>("users");
   const [rows, setRows] = useState<Row[]>([]);
-  const [providers, setProviders] = useState<Row[]>([]);
   const [backups, setBackups] = useState<Row[]>([]);
   const [editor, setEditor] = useState<Row | "new" | null>(null);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -58,12 +55,7 @@ export default function Admin({
       setRows(audit);
       setBackups(backup);
     } else {
-      const [data, provider] = await Promise.all([
-        api<Row[]>(paths[tab]),
-        api<Row[]>("/admin/providers"),
-      ]);
-      setRows(data);
-      setProviders(provider);
+      setRows(await api<Row[]>(paths[tab]));
     }
   }
   useEffect(() => {
@@ -109,7 +101,6 @@ export default function Admin({
       setValues({
         adapter: "openai",
         role: "WRITER",
-        provider_id: providers[0]?.id || "",
         parameters: '{"temperature": 0.7}',
         definition: JSON.stringify(
           studio.templates[0]?.published_version?.definition || {},
@@ -122,7 +113,7 @@ export default function Admin({
         Object.fromEntries(
           Object.entries({
             ...row,
-            credential: "",
+            api_key: "",
             password: "",
             parameters: JSON.stringify(row.parameters || {}, null, 2),
             definition: JSON.stringify(
@@ -179,38 +170,21 @@ export default function Admin({
             "POST",
             { password: values.password },
           );
-      } else if (tab === "providers") {
-        const body = {
-          name: values.name,
-          retention_description: values.retention_description,
-          deletion_description: values.deletion_description,
-          incident_description: values.incident_description,
-          ...(values.credential ? { credential: values.credential } : {}),
-        };
-        await api(
-          editor === "new"
-            ? paths.providers
-            : `${paths.providers}/${(editor as Row).id}`,
-          editor === "new" ? "POST" : "PATCH",
-          editor === "new"
-            ? { ...body, slug: values.slug, adapter: values.adapter }
-            : body,
-        );
       } else if (tab === "models") {
         const body = {
+          display_name: values.display_name,
+          adapter: values.adapter,
           model_name: values.model_name,
-          endpoint: values.endpoint || null,
+          base_url: values.base_url || null,
           parameters: JSON.parse(values.parameters || "{}"),
-          ...(values.credential ? { credential: values.credential } : {}),
+          ...(values.credential ? { api_key: values.credential } : {}),
         };
         await api(
           editor === "new"
             ? paths.models
             : `${paths.models}/${(editor as Row).id}`,
           editor === "new" ? "POST" : "PATCH",
-          editor === "new"
-            ? { ...body, provider_id: values.provider_id }
-            : body,
+          body,
         );
       } else if (tab === "templates") {
         const body = {
@@ -294,73 +268,26 @@ export default function Admin({
               <p className="hint">用户下次登录必须修改初始密码。</p>
             </>
           )}
-          {tab === "providers" && (
-            <>
-              {input("name", "供应商名称")}
-              {editor === "new" && (
-                <>
-                  {input("slug", "供应商标识")}
-                  <Field label="接口类型">
-                    <select
-                      disabled={busy}
-                      value={values.adapter}
-                      onChange={(e) =>
-                        setValues({ ...values, adapter: e.target.value })
-                      }
-                    >
-                      <option value="openai">OpenAI 兼容</option>
-                      <option value="anthropic">Anthropic</option>
-                      <option value="mock">本地测试 Mock</option>
-                    </select>
-                  </Field>
-                </>
-              )}
-              {input("retention_description", "数据保留说明", {
-                multiline: true,
-              })}
-              {input("deletion_description", "数据删除说明", {
-                multiline: true,
-              })}
-              {input("incident_description", "故障与重试说明", {
-                multiline: true,
-              })}
-              {input("credential", "API 密钥（留空保持现有凭证）", {
-                secret: true,
-                optional: true,
-              })}
-            </>
-          )}
           {tab === "models" && (
             <>
-              {editor === "new" && (
-                <Field label="模型供应商">
-                  <select
-                    required
-                    disabled={busy}
-                    value={values.provider_id}
-                    onChange={(e) =>
-                      setValues({ ...values, provider_id: e.target.value })
-                    }
-                  >
-                    {providers.map((p) => (
-                      <option value={p.id} key={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-              )}
+              {input("display_name", "显示名称")}
+              <Field label="接口类型">
+                <select disabled={busy} value={values.adapter} onChange={(e) => setValues({ ...values, adapter: e.target.value })}>
+                  <option value="openai">OpenAI 兼容</option>
+                  <option value="anthropic">Anthropic 原生</option>
+                </select>
+              </Field>
               {input("model_name", "模型标识")}
-              {input("endpoint", "接口地址（留空使用官方默认地址）", {
+              {input("base_url", "base_url（留空使用官方默认地址）", {
                 optional: true,
               })}
               {input("parameters", "调用参数 JSON", { multiline: true })}
-              {input("credential", "模型专用 API 密钥（可选）", {
+              {input("credential", "API key（留空保持现有密钥）", {
                 secret: true,
                 optional: true,
               })}
               <p className="hint">
-                每次保存创建新的模型配置版本，旧授权随之失效。
+                保存创建不可变版本，仅影响后续调用。留空密钥表示保留，填写新值表示轮换。
               </p>
             </>
           )}
@@ -404,6 +331,7 @@ export default function Admin({
                     {String(
                       row.username ||
                         row.name ||
+                        row.display_name ||
                         row.model_name ||
                         row.event_type ||
                         row.id,
@@ -412,10 +340,8 @@ export default function Admin({
                   <small>
                     {tab === "users"
                       ? `${row.role === "ADMIN" ? "管理员" : "普通用户"} · ${row.is_active ? "启用" : "停用"}`
-                      : tab === "providers"
-                        ? `${row.adapter} · ${row.enabled ? "已启用" : "未启用"}`
-                        : tab === "models"
-                          ? `v${row.version} · ${row.status} · ${providers.find((p) => p.id === row.provider_id)?.name || ""}`
+                      : tab === "models"
+                          ? `v${row.version} · ${row.status} · ${row.enabled ? "启用" : "停用"} · ${row.model_name}`
                           : tab === "templates"
                             ? `已发布 v${(row.published_version as { version?: number } | null)?.version || "—"}`
                             : formatDate(String(row.created_at))}
@@ -447,13 +373,13 @@ export default function Admin({
                     {row.is_active ? "停用" : "启用"}
                   </Button>
                 )}
-                {tab === "providers" && (
+                {tab === "models" && row.status === "ACTIVE" && (
                   <Button
                     small
                     disabled={busy}
                     onClick={() =>
                       run(async () => {
-                        await api(`${paths.providers}/${row.id}`, "PATCH", {
+                        await api(`${paths.models}/${row.id}`, "PATCH", {
                           enabled: !row.enabled,
                         });
                       })
@@ -536,7 +462,7 @@ export default function Admin({
                   await api(`/admin/backups/${restore}/restore`, "POST");
                   onRestored();
                   setRestore(null);
-                  setNotice("备份已恢复，需要重新确认外发授权。");
+                  setNotice("备份已恢复，未完成调用已结束。");
                 })
               }
             >
