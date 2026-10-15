@@ -1125,10 +1125,17 @@ export default function Workspace({
               )}
               <div ref={chatEnd} />
             </div>
-            <div className="chat-compose">
+            <form
+              className="chat-compose"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void sendMessage();
+              }}
+            >
               <div className="suggestion-chips">
                 {["让冲突更有张力", "探索人物的动机"].map((text) => (
                   <button
+                    type="button"
                     key={text}
                     onClick={() => setMessage(text)}
                     disabled={!editable || disabled}
@@ -1180,7 +1187,7 @@ export default function Workspace({
                 </select>
                 <IconButton
                   label="发送创作对话"
-                  onClick={() => { void sendMessage(); }}
+                  type="submit"
                   disabled={
                     disabled || aiBusy || !editable || !message.trim() || !chosenModel
                   }
@@ -1193,7 +1200,7 @@ export default function Workspace({
                   ? "本地示例回复 · 不调用外部模型"
                 : "使用所选模型进行创作 · 当前消息、设定和近期对话将用于本次请求"}
               </p>
-            </div>
+            </form>
           </aside>
         )}
       </div>

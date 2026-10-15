@@ -45,6 +45,7 @@ export default function Admin({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [restore, setRestore] = useState<string | null>(null);
+  const [removeModel, setRemoveModel] = useState<Row | null>(null);
   const lock = useRef(false);
   async function load() {
     if (tab === "operations") {
@@ -55,7 +56,8 @@ export default function Admin({
       setRows(audit);
       setBackups(backup);
     } else {
-      setRows(await api<Row[]>(paths[tab]));
+      const next = await api<Row[]>(paths[tab]);
+      setRows(tab === "models" ? next.filter((row) => row.status !== "DELETED") : next);
     }
   }
   useEffect(() => {
@@ -388,6 +390,15 @@ export default function Admin({
                     {row.enabled ? "停用" : "启用"}
                   </Button>
                 )}
+                {tab === "models" && row.status === "ACTIVE" && (
+                  <Button
+                    small
+                    disabled={busy}
+                    onClick={() => setRemoveModel(row)}
+                  >
+                    删除
+                  </Button>
+                )}
                 {tab === "templates" && (
                   <Button
                     small
@@ -467,6 +478,32 @@ export default function Admin({
               }
             >
               确认恢复备份
+            </Button>
+          </div>
+        </div>
+      )}
+      {removeModel && (
+        <div className="notice">
+          <p>
+            确定删除模型“{String(removeModel.display_name || removeModel.model_name)}”吗？
+            已有对话和历史记录会保留。
+          </p>
+          <div className="row">
+            <Button disabled={busy} onClick={() => setRemoveModel(null)}>
+              取消删除
+            </Button>
+            <Button
+              primary
+              disabled={busy}
+              onClick={() =>
+                void run(async () => {
+                  await api(`${paths.models}/${removeModel.id}`, "DELETE");
+                  setRemoveModel(null);
+                  setNotice("模型配置已删除。");
+                })
+              }
+            >
+              确认删除模型
             </Button>
           </div>
         </div>

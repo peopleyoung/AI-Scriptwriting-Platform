@@ -539,6 +539,50 @@ def register_feature_routes(
             db.commit()
         return _config_response(config)
 
+    @app.delete("/api/v1/admin/model-configs/{config_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_model_config(config_id: str, request: Request, actor: User = Depends(admin_user), db: Session = Depends(get_db)):
+        check_csrf(request)
+        current = db.get(ModelConfigVersion, config_id)
+        if current is None:
+            raise error("MODEL_CONFIG_NOT_FOUND", "model configuration not found", status.HTTP_404_NOT_FOUND)
+        identity = db.scalar(
+            select(ModelConfiguration)
+            .where(ModelConfiguration.id == current.model_id)
+            .with_for_update()
+        ) if current.model_id else None
+        if identity is not None:
+            identity.enabled = False
+            versions = db.scalars(
+                select(ModelConfigVersion)
+                .where(ModelConfigVersion.model_id == identity.id)
+                .with_for_update()
+            ).all()
+        else:
+            versions = [current]
+        if current.provider is not None:
+            current.provider.enabled = False
+        for version in versions:
+            version.status = "DELETED"
+            for consent in db.scalars(
+                select(ExternalConsent).where(
+                    ExternalConsent.model_config_version_id == version.id,
+                    ExternalConsent.status == "ACTIVE",
+                )
+            ).all():
+                consent.status = "REVOKED"
+                consent.revoked_at = _now()
+        audit(
+            db,
+            "MODEL_CONFIG_DELETED",
+            actor=actor,
+            metadata={"model_id": current.model_id, "config_id": current.id},
+        )
+        db.commit()
+        if identity is not None:
+            cancel_calls(db, model_id=identity.id, code="MODEL_CONFIG_NOT_AVAILABLE")
+            db.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @app.get("/api/v1/admin/model-configs/{config_id}", response_model=ModelConfigResponse)
     def get_model_config(config_id: str, actor: User = Depends(admin_user), db: Session = Depends(get_db)):
         config = db.get(ModelConfigVersion, config_id)

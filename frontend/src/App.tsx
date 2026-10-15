@@ -22,6 +22,7 @@ export default function App() {
   const [templateId, setTemplateId] = useState<string>();
   const [error, setError] = useState("");
   const [accountBusy, setAccountBusy] = useState(false);
+  const [passwordOpen, setPasswordOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [dark, setDark] = useState(
     () => localStorage.getItem("mujian-theme") === "dark",
@@ -172,6 +173,7 @@ export default function App() {
     onPage: go,
     onAccount: () => {
       setError("");
+      setPasswordOpen(false);
       setModal("account");
     },
     onHelp: () => setModal("help"),
@@ -254,11 +256,20 @@ export default function App() {
         <Modal
           title="你的创作空间"
           description={`${studio.user.username} · ${studio.user.role === "ADMIN" ? "管理员" : "普通用户"}`}
-          onClose={() => setModal(null)}
+          onClose={() => {
+            setPasswordOpen(false);
+            setModal(null);
+          }}
           busy={accountBusy}
           footer={
             <>
-              <Button onClick={() => setModal(null)} disabled={accountBusy}>
+              <Button
+                onClick={() => {
+                  setPasswordOpen(false);
+                  setModal(null);
+                }}
+                disabled={accountBusy}
+              >
                 继续创作
               </Button>
               <Button onClick={logout} disabled={accountBusy}>
@@ -299,12 +310,19 @@ export default function App() {
               {studio.user.role === "ADMIN" && (
                 <Button onClick={() => setModal("admin")}>平台管理</Button>
               )}
-              <PasswordForm
-                onDone={() => {
-                  setModal(null);
-                  notify("登录密码已更新。");
-                }}
-              />
+              {!passwordOpen ? (
+                <Button onClick={() => setPasswordOpen(true)}>
+                  修改登录密码
+                </Button>
+              ) : (
+                <PasswordForm
+                  onDone={() => {
+                    setPasswordOpen(false);
+                    setModal(null);
+                    notify("登录密码已更新。");
+                  }}
+                />
+              )}
             </>
           )}
           <ErrorMessage message={error} />

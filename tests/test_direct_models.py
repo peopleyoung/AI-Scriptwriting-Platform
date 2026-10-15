@@ -29,6 +29,22 @@ def test_models_are_independent_and_credentials_never_returned(tmp_path):
         assert 'ciphertext' not in response.text and 'api_key' not in response.text
 
 
+def test_model_configuration_can_be_deleted_without_removing_history(tmp_path):
+    with _client(tmp_path) as client:
+        client.post('/api/v1/admin/bootstrap', json={'username': 'admin', 'password': 'Admin-password-123'})
+        _login(client, 'admin', 'Admin-password-123')
+        first = client.post('/api/v1/admin/model-configs', json={'display_name': '待删除模型', 'model_name': 'before-delete'}).json()
+        current = client.patch(f"/api/v1/admin/model-configs/{first['id']}", json={'model_name': 'after-update'}).json()
+
+        deleted = client.delete(f"/api/v1/admin/model-configs/{current['id']}")
+
+        assert deleted.status_code == 204, deleted.text
+        assert client.get('/api/v1/model-configs').json() == []
+        history = {row['id']: row for row in client.get('/api/v1/admin/model-configs').json()}
+        assert history[first['id']]['status'] == 'DELETED'
+        assert history[current['id']]['status'] == 'DELETED'
+
+
 @pytest.mark.parametrize('adapter', ['openai', 'anthropic'])
 def test_direct_models_use_the_selected_http_protocol(tmp_path, adapter):
     with model_server() as upstream, _client(tmp_path) as client:
