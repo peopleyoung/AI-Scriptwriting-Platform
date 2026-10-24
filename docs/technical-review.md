@@ -39,7 +39,7 @@
 
 **要求**：确认记录绑定 `work_id + provider + model + data_classes + source_revision`，保存确认人和时间；供应商、模型、发送字段或作品设定发生变化时失效；所有者可撤销；没有有效确认时禁止创建外部生成任务。调用记录不得包含提示词和模型原文。
 
-> **漂移标注（2026-10-24）**：逐次外发确认已由 [ADR-0011](./adr/0011-direct-model-configuration-and-member-invocation.md) 替代。当前没有外发确认的创建/撤销 API，OWNER/EDITOR 按作品成员权限直接发起创作对话和生成；`external_consents` 表（`app/models.py:281-294`）仅为历史数据结构及备份范围。模型调用记录仍只保存元数据，不保存完整提示词和响应。
+> **漂移标注（2026-10-24）**：逐次外发确认已由 [ADR-0011](./adr/0011-direct-model-configuration-and-member-invocation.md) 替代。当前没有 `external_consents` 的创建/撤销 API，ADR-0011 的直接成员调用路径不依赖逐次 consent；OWNER/EDITOR 按作品成员权限直接发起创作对话和生成。`external_consents` 历史表（`app/models.py:281-294`）、`GenerationJob.consent_id` 外键（`app/models.py:359`）及 consent 撤销、备份与恢复兼容逻辑仍保留，并在运行时被读取（`app/features.py:253-258`、`530-533`、`566-573`、`926`、`1066-1070`、`1105-1107`）。模型调用记录仍只保存元数据，不保存完整提示词和响应。
 
 ### P1-4 凭证、备份和回收站保护不足以验收
 
