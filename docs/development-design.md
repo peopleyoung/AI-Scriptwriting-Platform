@@ -4,6 +4,9 @@
 
 状态：技术评审后基线。本文将已确认的产品规则转换为首版可实现的接口、数据和验收约束。没有既有代码或技术栈，因此技术选型属于建议方案。
 
+> **2026-10-24 漂移标注（当前实现基线）**
+> 本文保留历史设计原文；凡与当前代码不一致之处，以代码为准。当前实现边界是：单进程 / 单 worker / 单实例；显式保存版本当前仅 OWNER 有入口，EDITOR 显式保存是产品待定项 pending；发布正式稿与创建导出仅 OWNER；导出下载要求 active 作品成员和未过期 token；回收站 30 天是恢复截止，永久清理仅管理员手动触发。下文在对应漂移点列出代码依据，不删除历史原文。
+
 ## 1. 首版目标
 
 首版服务内部团队，目标不超过约 20 名并发创作者，使用 Docker Compose 单机部署。系统支持：
@@ -33,7 +36,13 @@
 | 凭证 | AES-256-GCM 或等价 AEAD | 主密钥来自 Docker Secret/受控文件，不进入日志或数据库 |
 | 部署 | Docker Compose | `web`、`api`、`worker`、`postgres`、`redis`、`storage`；健康检查和迁移入口固定 |
 
+> **漂移标注（2026-10-24，技术栈与部署）**
+> 表格中的 Redis、ARQ worker、六服务 Compose、Docker Secret 以及“没有既有代码”均为历史建议。当前仅 `db` 与 `app` 两个 Compose 服务（`docker-compose.yml:1-44`）；应用由单个 Uvicorn 进程启动（`Dockerfile:22-23`）；后台生成使用进程内单线程、内存队列和互斥锁（`app/worker.py:1-38`），没有 Redis/ARQ/RQ，不能据此设计多 worker 或水平扩展。凭证加密使用 AES-GCM（`app/crypto.py:11-22`），主密钥来自 `APP_EXTERNAL_ENCRYPTION_KEY`；production 要求稳定、至少 32 字符且非默认值（`app/config.py:22,34-37`），密钥轮换会使历史密文无法解密。逐次外发确认已由 ADR-0011 替代。
+
 2026-10-13 前端细化见[页面设计](frontend-page-design.md)与[开发方案](frontend-development-plan.md)。用户已确认完整页面范围、桌面优先且手机可操作、连续结构化正文编辑、编辑者显式保存版本、上游设定变更后的下游重新确认、正文生成期间的作品输入及外部对话锁定，以及作品内预览链接完成异地外发确认；相关 API 行为需补齐。相关 ADR 为 0007-0010，独立开发任务见[前端任务规格](../.scratch/frontend-experience/spec.md)。
+
+> **漂移标注（2026-10-24，角色与外发）**
+> 本段中的“编辑者显式保存版本”和预览链接外发确认属于历史访谈口径。当前显式保存版本入口仅 OWNER（`app/features.py:391-400`）；EDITOR 显式保存为产品待定项 pending，当前无对应入口。逐次外发确认由 ADR-0011 替代，创作对话和正文生成不再走该审批门禁。
 
 ## 3. 领域模型与关键约束
 
@@ -54,6 +63,9 @@
 
 所有作品查询必须经过 `WorkAccessService`. 资源 API 不接受调用方自带的 owner/member 字段作为授权依据。回收站作品不能被普通列表或生成 API 看到。
 
+> **漂移标注（2026-10-24，统一授权）**
+> 代码中不存在 `WorkAccessService` 类；上述名称仅为历史设计术语。当前统一入口是 `_require_work_member`（`app/main.py:444-468`），并由 `_require` 包装复用（`app/features.py:295-296`）。它校验 ACCEPTED 成员关系、作品非回收站状态和角色集合，管理员没有作品授权绕过分支。
+
 ### 3.3 创作决策和版本
 
 - `conversations` / `conversation_messages`：作品内对话；消息按作品权限读取，写入时保存作者和时间。
@@ -65,6 +77,9 @@
 
 恢复旧版本不是覆盖，而是基于旧版本创建新的 `work_version`，并递增作品 `revision`。任何写操作使用 `expected_revision`；不匹配返回 `409 WORK_REVISION_CONFLICT`。
 
+> **漂移标注（2026-10-24，表名、版本与错误码）**
+> 当前表名是 `script_versions`（`app/models.py:198-215`）和 `script_releases`（`app/models.py:216-231`）；确认设定保存在 `work_creative_data`（`app/models.py:143-163`），不存在 `locked_decisions` 表。显式保存版本当前仅 OWNER 可调用（`app/features.py:391-400`），恢复仅 OWNER（`app/features.py:434-443`），发布正式稿仅 OWNER（`app/features.py:450-464`）；EDITOR 显式保存为产品待定项 pending。并发写冲突的稳定错误码是 `REVISION_CONFLICT`，不是 `WORK_REVISION_CONFLICT`（`app/features.py:380-382,754-775`）。
+
 ### 3.4 模型与外发授权
 
 - `model_providers`：`OPENAI_COMPATIBLE` 或 `ANTHROPIC`、基础 URL、启用状态。
@@ -74,6 +89,9 @@
 - `invocation_records`：供应商、模型、时间、状态、token 用量、耗时、错误代码和追踪 ID；不保存完整请求/响应。
 
 外发确认至少绑定：作品、模型配置版本、发送的数据类别（对话/设定/大纲/正文）、输入 revision。供应商、模型、数据类别、输入 revision 或作品所有者撤销后，确认立即失效。
+
+> **漂移标注（2026-10-24，模型与外发）**
+> 当前表名为 `external_consents`（`app/models.py:281-294`），没有创建/撤销外发确认的当前 API；ADR-0011 已取消逐次外发确认门禁。正文生成由 OWNER/EDITOR 直接发起（`app/features.py:742-792`），但仍要求全阶段设定已确认、同作品串行、幂等键和 `input_revision` 冲突检测；错误码使用 `REVISION_CONFLICT`。
 
 ## 4. API 边界
 
@@ -134,6 +152,16 @@
 
 生成创建请求必须包含目标范围、模型配置 ID、输入 revision、幂等键和所需数据类别。API 只在有效外发确认和权限检查通过后入队。
 
+> **漂移标注（2026-10-24，API 路径）**
+> 当前规范路径与上文示例存在差异，以下列路径为准：
+> - 模型元数据：`GET /api/v1/model-configs`；
+> - 草稿与工作区：`GET/PATCH /api/v1/works/{work_id}/draft`、`GET /api/v1/works/{work_id}/workspace`；
+> - 设定阶段：`PATCH /api/v1/works/{work_id}/creative/{stage}`、`POST /api/v1/works/{work_id}/creative/{stage}/confirm`；
+> - 提案：`GET/POST /api/v1/works/{work_id}/change-proposals` 及 `/{proposal_id}/approve|reject`；
+> - 版本与发布：`POST /api/v1/works/{work_id}/versions`、`POST /api/v1/works/{work_id}/versions/{version_id}/restore`、`POST /api/v1/works/{work_id}/releases`；
+> - 生成与导出：`POST /api/v1/works/{work_id}/generation-jobs`、`POST /api/v1/works/{work_id}/exports`；下载为 `GET /api/v1/exports/{export_id}/download?token=...`。
+> 当前不存在 `external-consents` 创建/撤销路由；模型调用按 ADR-0011 由作品成员直接发起。版本相关代码依据见 `app/features.py:391-464,742-792,874-900,1126-1138`。
+
 内部模型适配器接口：
 
 ```text
@@ -162,6 +190,9 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 - 成功提交版本时使用数据库事务检查 `source_revision`；冲突则任务为 `FAILED`，错误码 `WORK_REVISION_CONFLICT`，不产生孤立正文。
 - worker 崩溃由租约超时恢复为 `QUEUED`，重试次数有限并记录 attempt。
 
+> **漂移标注（2026-10-24，worker 恢复）**
+> 当前没有租约超时或 `QUEUED` 自动恢复机制。进程启动时把遗留 `RUNNING` 任务标记为 `FAILED` / `WORKER_INTERRUPTED`，仅把数据库中的 `QUEUED` 任务重新入内存队列（`app/main.py:634-649`）；进程退出时停止 worker 并收口在途调用（`app/main.py:650-656`）。队列不跨进程持久化，因此该行为只适用于单实例。
+
 ### 5.2 ChangeProposal
 
 `PENDING -> APPROVED | REJECTED | WITHDRAWN`。审批只允许作品所有者执行；已审批提案只能通过新的提案反向修改，不能直接编辑历史记录。
@@ -169,6 +200,9 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 ### 5.3 Work
 
 `ACTIVE -> TRASHED -> ACTIVE`，或 `TRASHED -> PURGED`。普通资源查询过滤 `TRASHED`；回收站恢复和永久删除需要所有者操作和审计记录。每日清理任务只处理超过 30 天的回收站作品。
+
+> **漂移标注（2026-10-24，回收站）**
+> 当前作品状态只有 `ACTIVE` / `TRASHED`，没有 `PURGED` 状态，也没有每日自动清理任务。30 天是恢复截止：仅 OWNER 可恢复，超期返回 `TRASH_RETENTION_EXPIRED`（`app/main.py:1341-1355`）。永久清理仅管理员手动调用 `POST /api/v1/admin/trash/purge`，该端点只删除已超过保留期的回收站作品并写审计（`app/features.py:1112-1124`）。
 
 ## 6. Docker Compose 与运维
 
@@ -178,6 +212,9 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 
 必须提供：`.env.example`（只含变量名）、`docker-compose.yml`、`Dockerfile`、迁移命令、备份/恢复脚本、健康检查端点和本地启动文档。真实密钥只通过 Docker Secret 或部署环境注入。
 
+> **漂移标注（2026-10-24，部署与密钥）**
+> 当前 Compose 只有 `db` 和 `app`（`docker-compose.yml:1-44`），没有独立 web/worker/redis/storage 服务；真实密钥通过 `APP_EXTERNAL_ENCRYPTION_KEY` 环境变量注入，而不是 Docker Secret。生产校验与轮换影响见 `app/config.py:22,34-37` 和 `app/crypto.py:11-22`。
+
 ## 7. 测试策略
 
 - 单元测试：授权策略、状态机、模型错误分类、凭证加解密和参数校验。
@@ -186,6 +223,9 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 - 合约测试：OpenAI 兼容和 Anthropic 适配器的最小请求、流式响应、usage、错误和取消。
 - 安全测试：日志扫描 prompt/密钥、停用会话、首次改密、CSRF、短下载 URL、备份访问。
 - 端到端验收：创建账号 → 创建作品 → 确认设定 → 外发确认 → 分段生成 → 版本恢复 → 发布 → Markdown/DOCX 导出 → 回收站恢复。
+
+> **漂移标注（2026-10-24，验收）**
+> 上述端到端步骤中的“外发确认”已经过时，应改为成员直接调用已启用模型；“30 天清理”也不应作为自动任务验收项，应验证 30 天恢复截止和管理员手动 purge 端点（`app/features.py:1112-1124`）。
 
 ## 8. 分阶段开发任务
 
@@ -199,3 +239,6 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 6. **模型适配和外发确认**：OpenAI 兼容与 Anthropic 适配器、凭证加密、模型选择、同意生命周期、调用元数据。
 7. **协作工作区和导出**：三栏工作区、SSE/轮询任务进度、版本比较/恢复、正式稿发布、Markdown/DOCX 导出。
 8. **备份、安全与验收**：加密备份、30 天清理、恢复演练、日志脱敏、权限/并发/供应商合约测试和 Docker 验收。
+
+> **漂移标注（2026-10-24，任务清单）**
+> 清单中的 `WorkAccessService`、Redis worker 和 30 天自动清理是历史任务名；当前实现分别对应 `_require_work_member` / `_require`、进程内单线程 worker，以及管理员手动 purge。后续拆任务不得按这些旧名称推定已有实现或自动调度。
