@@ -103,6 +103,7 @@ export default function Home({
   works,
   templates,
   invitations,
+  retentionDays,
   page,
   onOpen,
   onNew,
@@ -113,6 +114,7 @@ export default function Home({
   works: Work[];
   templates: Template[];
   invitations: Invitation[];
+  retentionDays: number;
   page: Page;
   onOpen: (work: Work) => void;
   onNew: (templateId?: string) => void;
@@ -254,7 +256,7 @@ export default function Home({
             ? "一个画面，一句对白，一个还没成形的念头。让我们从这里开始。"
             : page === "team"
               ? "让好的故事，在共同创作中发生。"
-              : "作品保留 30 天，所有者可在此恢复。"}
+              : `作品保留 ${retentionDays} 天，所有者可在此恢复。`}
         </p>
       </div>
       {page === "works" && (
@@ -526,7 +528,7 @@ export default function Home({
       {deleting && (
         <Modal
           title="将作品移入回收站？"
-          description="作品在 30 天内可以恢复。"
+          description={`作品在 ${retentionDays} 天内可以恢复。`}
           onClose={() => setDeleting(null)}
           busy={busy}
           footer={
