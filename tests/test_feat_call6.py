@@ -159,6 +159,40 @@ def test_development_and_test_allow_placeholder_values():
     assert Settings(environment="development", bootstrap_admin_password="password").bootstrap_admin_password == "password"
 
 
+def _example_env_values() -> dict[str, str]:
+    path = Path(__file__).resolve().parents[1] / ".env.example"
+    values = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+    return values
+
+
+# The shipped .env.example placeholders are long enough to pass a naive length
+# check; pinning the validator to the actual file values is what keeps the
+# example and the Fail-Fast rules from drifting apart again.
+@pytest.mark.parametrize(
+    "field, valid_others",
+    [
+        ("external_encryption_key", {"bootstrap_admin_password": "Valid-Pass-1234", "bootstrap_secret": "valid-random-setup-secret-16chars"}),
+        ("bootstrap_admin_password", {"external_encryption_key": "x" * 40, "bootstrap_secret": "valid-random-setup-secret-16chars"}),
+        ("bootstrap_secret", {"external_encryption_key": "x" * 40, "bootstrap_admin_password": "Valid-Pass-1234"}),
+    ],
+)
+def test_env_example_placeholders_are_rejected_in_production(field, valid_others):
+    example_key = {"external_encryption_key": "APP_EXTERNAL_ENCRYPTION_KEY", "bootstrap_admin_password": "APP_BOOTSTRAP_ADMIN_PASSWORD", "bootstrap_secret": "APP_BOOTSTRAP_SECRET"}[field]
+    placeholder = _example_env_values()[example_key]
+    with pytest.raises(ValidationError) as err:
+        Settings(environment="production", **{**valid_others, field: placeholder})
+    assert example_key in str(err.value)
+    # The offending example value must not be echoed back in the error.
+    assert placeholder not in str(err.value)
+
+
+
 # --- FEAT-04: worker restart recovery + retry lineage ---
 def _queued_job(client, upstream):
     _confirm_all(client, work := _work(client))

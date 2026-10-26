@@ -6,7 +6,7 @@
 
 ## 版本保存与协作权限（更新）
 
-手动保存版本对 OWNER 与 EDITOR 开放：编辑者可以把当前草稿固化为整部作品版本，便于比较与留档。恢复版本、发布正式稿、导出仍限 OWNER。越权调用返回 403 `WORK_ACCESS_DENIED`，前端按 `permissions` 中 `can_save_version` 与 `can_restore_version` 分别控制按钮，避免编辑者看不到自己能做的操作、或误以为能发布。
+手动保存版本对 OWNER 与 EDITOR 开放：编辑者可以把当前草稿固化为整部作品版本，便于比较与留档。恢复版本、发布正式稿、导出仍限 OWNER。越权调用返回 403 `WORK_ACCESS_DENIED`。服务端在 workspace `permissions` 中给出 `can_save_version`（OWNER+EDITOR）与 `can_restore_version`/`can_publish`/`can_export`（仅 OWNER）作为唯一权限真相；前端保存与恢复按钮以成员角色派生的「可编辑 / 仅所有者」布尔量控制，其判定与上述 `permissions` 字段语义一致（编辑态=可保存、所有者态=可恢复），从而避免编辑者看不到自己能做的操作或误以为能发布。
 
 每个版本记录作者显示名（`author_display_name`），版本列表标签使用「来源 · 作者 · 修订 {work_revision} · 时间」而非列表序号：序号会随新保存错位，`work_revision` 才是稳定且可与草稿冲突判断对应的标识。作者账号被删除时显示名回退为「已移除成员」。
 

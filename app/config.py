@@ -7,6 +7,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Placeholders that must never survive into a production deployment.
 _WEAK_PASSWORDS = {"password", "password1", "passw0rd", "admin", "admin123", "changeme", "secret", "1234567890", "qwertyuiop", "letmein1"}
 
+# Prefixes used by the shipped .env.example; a value that still carries one was
+# never replaced with a real secret. Checked case-insensitively against the
+# encryption key, admin password and bootstrap secret alike.
+_PLACEHOLDER_PREFIXES = ("change-this", "change_this", "replace-with", "replace_with")
+
+
+def _is_placeholder(value: str) -> bool:
+    lowered = value.lower()
+    return any(lowered.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES)
+
 
 class Settings(BaseSettings):
     app_name: str = "AI Scriptwriting Platform"
@@ -39,14 +49,14 @@ class Settings(BaseSettings):
         if self.environment != "production":
             return self
         key = self.external_encryption_key
-        if len(key) < 32 or key == "development-only-key" or key.startswith("change-this"):
+        if len(key) < 32 or key == "development-only-key" or _is_placeholder(key):
             raise ValueError("production requires APP_EXTERNAL_ENCRYPTION_KEY with at least 32 characters and no placeholder value")
         if self.bootstrap_admin_password is not None:
             password = self.bootstrap_admin_password
-            if len(password) < 12 or password.startswith("change-this") or password.lower() in _WEAK_PASSWORDS:
+            if len(password) < 12 or _is_placeholder(password) or password.lower() in _WEAK_PASSWORDS:
                 raise ValueError("production requires APP_BOOTSTRAP_ADMIN_PASSWORD with at least 12 characters and no placeholder or common weak value")
         if self.bootstrap_secret is not None:
-            if len(self.bootstrap_secret) < 16 or "change-this" in self.bootstrap_secret.lower():
+            if len(self.bootstrap_secret) < 16 or _is_placeholder(self.bootstrap_secret):
                 raise ValueError("production requires APP_BOOTSTRAP_SECRET with at least 16 characters and no placeholder value")
         return self
 
