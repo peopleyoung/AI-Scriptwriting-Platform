@@ -64,6 +64,7 @@ export interface Version {
   content: Script;
   created_at: string;
   work_revision: number;
+  author_display_name?: string | null;
 }
 export interface Release {
   id: string;
@@ -227,5 +228,6 @@ export interface Job {
   target_path: { episode?: number; scene?: number; fragment?: string };
   error_code: string | null;
   error_message: string | null;
+  retry_of_job_id?: string | null;
   created_at: string;
 }

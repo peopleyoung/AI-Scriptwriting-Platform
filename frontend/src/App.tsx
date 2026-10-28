@@ -205,6 +205,7 @@ export default function App() {
             works={works}
             templates={studio.templates}
             invitations={studio.invitations}
+            retentionDays={studio.retentionDays}
             page={page}
             onOpen={open}
             onNew={(id) => {

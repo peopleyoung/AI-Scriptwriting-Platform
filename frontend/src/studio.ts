@@ -39,7 +39,14 @@ const errorMessages: Record<string, string> = {
   RELEASE_REQUIRED: "请先发布一个正式稿。",
   USER_NOT_FOUND: "该账号不存在，请确认登录名。",
   STAGE_ORDER_INVALID: "请按创作简报、人物、故事大纲的顺序确认。",
+  WORKER_INTERRUPTED: "服务重启导致任务中断，原正文已保留。",
+  WORK_INACTIVE: "作品已移入回收站，无法继续生成，请先恢复作品。",
+  EXTERNAL_CONSENT_REQUIRED: "外部数据授权已失效，请重新确认后再重试任务。",
 };
+export function jobErrorText(code: string | null): string {
+  if (!code) return "";
+  return errorMessages[code] || "生成未完成，原正文已保留。可重试任务。";
+}
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -107,6 +114,7 @@ export class Studio {
   templates: Template[] = [];
   invitations: Invitation[] = [];
   models: Model[] = [];
+  retentionDays = 30;
   constructor(
     public mode: "demo" | "live",
     public user: User = demoUser,
@@ -143,6 +151,14 @@ export class Studio {
         api<Template[]>("/templates"),
         api<Model[]>("/model-configs"),
       ]);
+      try {
+        const runtime = await api<{ trash_retention_days: number }>(
+          "/runtime-config",
+        );
+        this.retentionDays = runtime.trash_retention_days;
+      } catch {
+        this.retentionDays = 30;
+      }
       const [works, trash, invitations] = await Promise.all([
         api<Partial<Work>[]>("/works"),
         api<Partial<Work>[]>("/trash"),
@@ -315,6 +331,7 @@ export class Studio {
       content: clone(content),
       created_at: now(),
       work_revision: work.revision + 1,
+      author_display_name: this.user.username,
     };
     work.versions.push(version);
     return this.finish(work);
@@ -549,8 +566,11 @@ export class Studio {
       await api(`/works/${id}/generation-jobs/${jobId}/cancel`, "POST");
   }
   async retryJob(id: string, jobId: string) {
-    await api(`/works/${id}/generation-jobs/${jobId}/retry`, "POST");
-    return this.waitForJob(id, jobId);
+    const created = await api<import("./types").Job>(
+      `/works/${id}/generation-jobs/${jobId}/retry`,
+      "POST",
+    );
+    return this.waitForJob(id, created.id);
   }
   private async waitForJob(id: string, jobId: string) {
     for (;;) {
