@@ -360,6 +360,7 @@ class GenerationJob(Base):
     input_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="QUEUED", nullable=False, index=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    retry_of_job_id: Mapped[str | None] = mapped_column(ForeignKey("generation_jobs.id", ondelete="SET NULL"), nullable=True, index=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_version_id: Mapped[str | None] = mapped_column(ForeignKey("script_versions.id", ondelete="SET NULL"), nullable=True)

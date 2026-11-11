@@ -2,6 +2,8 @@
 
 2026-10-14 更新：模型配置、模型切换、创作对话及外发审批相关规则以[模型配置与创作对话设计](model-chat-design.md)及 [ADR-0011](adr/0011-direct-model-configuration-and-member-invocation.md) 为准；下文相关旧规则作为历史基线保留。新规则已实现；旧供应商与逐次外发确认描述仅作为历史基线保留。
 
+2026-10-13 更新（部署拓扑）：下文关于 Redis/RQ 独立队列与多服务分离 worker 的拓扑是评审阶段的设想方案，**并非当前实现**。现行实现为单进程、单 Uvicorn worker，生成队列驻留进程内存、数据库为唯一持久真相，回收站到期清理与进程重启后的任务补偿都由应用自身在启动/关闭时完成。以 [ADR-0012](adr/0012-single-process-trash-maintenance-and-worker-recovery.md) 与 [ADR-0009](adr/0009-work-input-lock-during-generation.md) 为准；本文相关章节仅作历史基线保留。
+
 状态：技术评审后基线。本文将已确认的产品规则转换为首版可实现的接口、数据和验收约束。没有既有代码或技术栈，因此技术选型属于建议方案。
 
 ## 1. 首版目标

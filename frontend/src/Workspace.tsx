@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { Header } from "./Home";
 import { CreativeContent, CreativeEditor, RuleInput, labels } from "./Forms";
-import { ApiError, scriptText, type Studio } from "./studio";
+import { ApiError, jobErrorText, scriptText, type Studio } from "./studio";
 import {
   definitionFields,
   type Job,
@@ -1503,7 +1503,7 @@ export default function Workspace({
                   恢复此版本
                 </Button>
               )}
-              {owner && (
+              {editable && (
                 <Button
                   primary
                   onClick={() =>
@@ -1536,11 +1536,11 @@ export default function Workspace({
                 onChange={(event) => setVersionId(event.target.value)}
               >
                 <option value="">选择版本</option>
-                {[...work.versions].reverse().map((v, i) => (
+                {[...work.versions].reverse().map((v) => (
                   <option key={v.id} value={v.id}>
-                    版本 {work.versions.length - i} ·{" "}
                     {sourceNames[v.source] || v.source} ·{" "}
-                    {formatDate(v.created_at)}
+                    {v.author_display_name || "已移除成员"} · 修订{" "}
+                    {v.work_revision} · {formatDate(v.created_at)}
                   </option>
                 ))}
               </select>
@@ -1553,10 +1553,11 @@ export default function Workspace({
                 <option value="">不比较</option>
                 {work.versions
                   .filter((v) => v.id !== versionId)
-                  .map((v, i) => (
+                  .map((v) => (
                     <option key={v.id} value={v.id}>
-                      {sourceNames[v.source] || v.source} · 修订{" "}
-                      {v.work_revision} · {i + 1}
+                      {sourceNames[v.source] || v.source} ·{" "}
+                      {v.author_display_name || "已移除成员"} · 修订{" "}
+                      {v.work_revision}
                     </option>
                   ))}
               </select>
@@ -1591,9 +1592,9 @@ export default function Workspace({
             <Empty
               title="为值得留住的这一刻，保存一个版本。"
               description={
-                owner
+                editable
                   ? "保存当前版本后，可以比较、恢复或发布正式稿。"
-                  : "由作品所有者保存版本后，可以在这里查看。"
+                  : "由所有者或编辑者保存版本后，可以在这里查看。"
               }
             />
           )}
@@ -1916,7 +1917,9 @@ export default function Workspace({
                       }[job.status]
                     }
                   </small>
-                  {job.error_code && <p className="hint">{job.error_code}</p>}
+                  {job.error_code && (
+                    <p className="hint">{jobErrorText(job.error_code)}</p>
+                  )}
                 </div>
                 {editable && ["QUEUED", "RUNNING"].includes(job.status) && (
                   <Button

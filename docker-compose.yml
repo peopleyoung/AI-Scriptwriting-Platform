@@ -2,13 +2,13 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: scriptwriting
-      POSTGRES_USER: scriptwriting
-      POSTGRES_PASSWORD: scriptwriting
+      POSTGRES_DB: ${POSTGRES_DB:-scriptwriting}
+      POSTGRES_USER: ${POSTGRES_USER:-scriptwriting}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a strong random database password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U scriptwriting -d scriptwriting"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scriptwriting} -d ${POSTGRES_DB:-scriptwriting}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -20,12 +20,13 @@ services:
       APP_EXTERNAL_ENCRYPTION_KEY: ${APP_EXTERNAL_ENCRYPTION_KEY:?Set a stable random encryption key of at least 32 characters}
       APP_BACKUP_DIR: /app/backups
       APP_MODEL_TIMEOUT_SECONDS: ${APP_MODEL_TIMEOUT_SECONDS:-120}
-      APP_DATABASE_URL: postgresql+psycopg://scriptwriting:scriptwriting@db:5432/scriptwriting
+      APP_TRASH_RETENTION_DAYS: ${APP_TRASH_RETENTION_DAYS:-30}
+      APP_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-scriptwriting}:${POSTGRES_PASSWORD:?Set a strong random database password}@db:5432/${POSTGRES_DB:-scriptwriting}
       APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-true}
       APP_AUTO_CREATE_SCHEMA: "false"
-      APP_BOOTSTRAP_SECRET: ${APP_BOOTSTRAP_SECRET:-change-this-setup-secret}
+      APP_BOOTSTRAP_SECRET: ${APP_BOOTSTRAP_SECRET:?Set a random setup secret of at least 16 characters}
       APP_BOOTSTRAP_ADMIN_USERNAME: ${APP_BOOTSTRAP_ADMIN_USERNAME:-admin}
-      APP_BOOTSTRAP_ADMIN_PASSWORD: ${APP_BOOTSTRAP_ADMIN_PASSWORD:-change-this-before-start}
+      APP_BOOTSTRAP_ADMIN_PASSWORD: ${APP_BOOTSTRAP_ADMIN_PASSWORD:?Set an initial admin password of at least 12 characters}
     depends_on:
       db:
         condition: service_healthy
