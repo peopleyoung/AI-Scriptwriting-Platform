@@ -9,4 +9,4 @@
 - 首版不提供管理员绕过作品授权的应用层应急阅读权限；管理员只有在被邀请为作品成员后才能访问正文。
 - 作品进入回收站后对协作者不可见，排队任务取消，外发确认失效；恢复后不会自动恢复原确认。
 
-2026-11-21 当前实现说明：回收站移动仍会取消排队/在途 AI 调用；30 天是恢复截止与永久清理期限。应用启动时和进程内维护线程约每日清理到期作品，管理员也可手动调用 `POST /api/v1/admin/trash/purge`；清理会写审计（`app/main.py::lifespan`、`app/lifecycle.py::purge_expired_works` / `start_trash_maintenance`、`app/features.py::purge_expired_trash`）。原文中的外发确认失效规则已由 [ADR-0011](0011-direct-model-configuration-and-member-invocation.md) 的成员直接调用模型规则替代。
+2026-11-21 当前实现说明：回收站移动仍会取消排队/在途 AI 调用；默认保留期为 30 天，实际期限由运行配置 `trash_retention_days` 决定，达到截止时间后禁止恢复。应用启动时会清理到期作品，存活进程内的维护线程随后约每日扫描并清理；管理员手动调用 `POST /api/v1/admin/trash/purge` 是补充路径。清理会写审计（`app/main.py::lifespan`、`app/lifecycle.py::purge_expired_works` / `start_trash_maintenance`、`app/features.py::purge_expired_trash`）。原文中的外发确认失效规则已由 [ADR-0011](0011-direct-model-configuration-and-member-invocation.md) 的成员直接调用模型规则替代。

@@ -7,7 +7,7 @@
 状态：技术评审后基线。本文将已确认的产品规则转换为首版可实现的接口、数据和验收约束。没有既有代码或技术栈，因此技术选型属于建议方案。
 
 > **2026-11-21 漂移标注（当前实现基线）**
-> 本文保留历史设计原文；凡与当前代码不一致之处，以代码为准。当前实现边界是：单进程 / 单 worker / 单实例；显式保存版本对 OWNER 与 EDITOR 开放；发布正式稿与创建导出仅 OWNER；导出下载要求 active 作品成员和未过期 token；回收站 30 天是恢复截止与永久清理期限，应用启动时和进程内维护线程约每日自动清理到期作品，管理员也可手动触发。下文在对应漂移点列出代码依据，不删除历史原文。
+> 本文保留历史设计原文；凡与当前代码不一致之处，以代码为准。当前实现边界是：单进程 / 单 worker / 单实例；显式保存版本对 OWNER 与 EDITOR 开放；发布正式稿与创建导出仅 OWNER；导出下载要求 active 作品成员和未过期 token。回收站默认保留 30 天，实际期限由运行配置 `trash_retention_days` 决定，达到截止时间后禁止恢复；应用启动时清理到期作品，存活进程内的维护线程随后约每日扫描并清理，管理员手动 purge 是补充路径。下文在对应漂移点列出代码依据，不删除历史原文。
 
 ## 1. 首版目标
 
@@ -204,7 +204,7 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 `ACTIVE -> TRASHED -> ACTIVE`，或 `TRASHED -> PURGED`。普通资源查询过滤 `TRASHED`；回收站恢复和永久删除需要所有者操作和审计记录。每日清理任务只处理超过 30 天的回收站作品。
 
 > **漂移标注（2026-11-21，回收站）**
-> 当前作品状态只有 `ACTIVE` / `TRASHED`，没有 `PURGED` 状态，但永久清理已自动执行。30 天同时是恢复截止和清理期限：仅 OWNER 可恢复，超期返回 `TRASH_RETENTION_EXPIRED`（`app/main.py::restore_work`）；应用启动时先清理一次，随后进程内维护线程约每 24 小时清理到期作品（`app/main.py::lifespan`、`app/lifecycle.py::_tick_interval_seconds`、`purge_expired_works`、`start_trash_maintenance`）。管理员还可手动调用 `POST /api/v1/admin/trash/purge`，清理操作写审计（`app/features.py::purge_expired_trash`）。
+> 当前作品状态只有 `ACTIVE` / `TRASHED`，没有 `PURGED` 状态，但永久清理已自动执行。回收站默认保留 30 天，实际期限由运行配置 `trash_retention_days` 决定；达到截止时间后，包括 OWNER 在内的所有人都不能恢复，恢复请求返回 `TRASH_RETENTION_EXPIRED`（`app/main.py::restore_work`）。应用启动时先清理一次，随后由存活进程内的维护线程约每 24 小时扫描并清理到期作品（`app/main.py::lifespan`、`app/lifecycle.py::_tick_interval_seconds`、`purge_expired_works`、`start_trash_maintenance`）；管理员手动调用 `POST /api/v1/admin/trash/purge` 是补充清理路径，操作会写审计（`app/features.py::purge_expired_trash`）。
 
 ## 6. Docker Compose 与运维
 
@@ -227,7 +227,7 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 - 端到端验收：创建账号 → 创建作品 → 确认设定 → 外发确认 → 分段生成 → 版本恢复 → 发布 → Markdown/DOCX 导出 → 回收站恢复。
 
 > **漂移标注（2026-10-24，验收）**
-> 上述端到端步骤中的“外发确认”已经过时，应改为成员直接调用已启用模型；回收站验收应覆盖 30 天恢复截止、应用启动/进程内维护线程自动清理，以及管理员手动 purge 端点（`app/main.py::lifespan`、`app/lifecycle.py::purge_expired_works` / `start_trash_maintenance`、`app/features.py::purge_expired_trash`）。
+> 上述端到端步骤中的“外发确认”已经过时，应改为成员直接调用已启用模型；回收站验收应覆盖由运行配置 `trash_retention_days` 决定的恢复截止（默认 30 天）、应用启动清理、存活进程内维护线程周期扫描，以及作为补充路径的管理员手动 purge 端点（`app/main.py::lifespan`、`app/lifecycle.py::purge_expired_works` / `start_trash_maintenance`、`app/features.py::purge_expired_trash`）。
 
 ## 8. 分阶段开发任务
 
@@ -243,4 +243,4 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 8. **备份、安全与验收**：加密备份、30 天清理、恢复演练、日志脱敏、权限/并发/供应商合约测试和 Docker 验收。
 
 > **漂移标注（2026-10-24，任务清单）**
-> 清单中的 `WorkAccessService`、Redis worker 和 30 天自动清理是历史任务名；当前实现分别对应 `_require_work_member` / `_require`、进程内单线程 worker，以及管理员手动 purge。后续拆任务不得按这些旧名称推定已有实现或自动调度。
+> 清单中的 `WorkAccessService`、Redis worker 和“自动清理待实现”均为历史任务背景：旧清单曾把 30 天自动清理列为待实现，这只描述当时的计划，不代表当前代码仍未实现。当前实现分别对应 `_require_work_member` / `_require`、进程内单线程 worker，以及应用启动清理和存活进程内维护线程的周期扫描；管理员手动 purge 是补充路径。后续拆任务不得按旧清单推定当前仍待实现或存在外部自动调度器。

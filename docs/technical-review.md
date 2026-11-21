@@ -13,7 +13,7 @@
 开发前必须把下面的阻塞项写入接口、数据库约束和自动化测试。它们不是新增产品功能，而是把已确认的权限、版本和数据保护要求变成可验证的实现规则。
 
 > **2026-11-21 漂移标注（当前实现基线）**
-> 本报告保留 2026-10-10 的原始评审意见；实现术语、权限、外发门禁、密钥来源和部署形态已经变化。当前以代码为准：单进程 / 单 worker / 单实例；显式保存版本对 OWNER 与 EDITOR 开放；发布正式稿与创建导出仅 OWNER，导出下载要求 active 作品成员和未过期 token；回收站 30 天是恢复截止与永久清理期限，应用启动和进程内维护线程约每日自动清理到期作品，管理员也可手动触发。以下在对应条目列出差异。
+> 本报告保留 2026-10-10 的原始评审意见；实现术语、权限、外发门禁、密钥来源和部署形态已经变化。当前以代码为准：单进程 / 单 worker / 单实例；显式保存版本对 OWNER 与 EDITOR 开放；发布正式稿与创建导出仅 OWNER，导出下载要求 active 作品成员和未过期 token。回收站默认保留 30 天，实际期限由运行配置 `trash_retention_days` 决定，达到截止时间后禁止恢复；应用启动时清理到期作品，存活进程内的维护线程随后约每日扫描并清理，管理员手动 purge 是补充路径。以下在对应条目列出差异。
 
 ## Findings
 
@@ -47,7 +47,7 @@
 
 **要求**：主密钥由 Docker Secret 或等价的受控文件注入，不进入镜像、Git、日志或数据库；供应商密钥使用 AEAD 加密并只返回掩码；备份独立加密并限制到管理员/运维；回收站作品对普通业务查询不可见，恢复和永久删除均写审计记录。恢复演练必须验证权限和外发确认不会被错误恢复。
 
-> **漂移标注（2026-11-21）**：当前主密钥来自 `APP_EXTERNAL_ENCRYPTION_KEY` 环境变量，而不是 Docker Secret。production 要求密钥稳定、至少 32 字符且非默认值（`app/config.py::Settings`）；模型凭证使用 AES-GCM 加密（`app/crypto.py::encrypt_secret`），轮换会破坏历史密文可解密性。回收站 30 天是恢复截止与清理期限，应用启动和进程内维护线程约每日自动清理到期作品，管理员也可手动 `POST /api/v1/admin/trash/purge`（`app/main.py::lifespan`、`app/lifecycle.py::purge_expired_works` / `start_trash_maintenance`、`app/features.py::purge_expired_trash`）。
+> **漂移标注（2026-11-21）**：当前主密钥来自 `APP_EXTERNAL_ENCRYPTION_KEY` 环境变量，而不是 Docker Secret。production 要求密钥稳定、至少 32 字符且非默认值（`app/config.py::Settings`）；模型凭证使用 AES-GCM 加密（`app/crypto.py::encrypt_secret`），轮换会破坏历史密文可解密性。回收站默认保留 30 天，实际期限由运行配置 `trash_retention_days` 决定，达到截止时间后禁止恢复；应用启动时清理到期作品，存活进程内的维护线程随后约每日扫描并清理，管理员手动 `POST /api/v1/admin/trash/purge` 是补充路径（`app/main.py::lifespan`、`app/lifecycle.py::purge_expired_works` / `start_trash_maintenance`、`app/features.py::purge_expired_trash`）。
 
 ## P2 风险
 
@@ -79,7 +79,7 @@
 5. 模板版本快照、正式稿导出、回收站恢复/永久删除的测试。
 6. Docker Compose 健康检查、迁移、备份恢复和最小权限配置的验收记录。
 
-> **漂移标注（2026-10-24）**：第 3 项“外发确认失效/撤销”门禁已由 ADR-0011 替代，应改为验证成员直接调用、模型启停和同作品串行约束；第 6 项应按当前 `db` + `app` 双服务 Compose 验收，不得把六服务拓扑写成验收前提。回收站永久删除验收应对准管理员手动 purge 端点。
+> **漂移标注（2026-10-24）**：第 3 项“外发确认失效/撤销”门禁已由 ADR-0011 替代，应改为验证成员直接调用、模型启停和同作品串行约束；第 6 项应按当前 `db` + `app` 双服务 Compose 验收，不得把六服务拓扑写成验收前提。回收站验收应覆盖由运行配置 `trash_retention_days` 决定的恢复截止（默认 30 天）、应用启动清理、存活进程内维护线程周期扫描，以及作为补充路径的管理员手动 purge 端点。
 
 ## 不属于本次阻塞项
 
