@@ -2,10 +2,12 @@
 
 2026-10-14 更新：模型配置、模型切换、创作对话及外发审批相关规则以[模型配置与创作对话设计](model-chat-design.md)及 [ADR-0011](adr/0011-direct-model-configuration-and-member-invocation.md) 为准；下文相关旧规则作为历史基线保留。新规则已实现；旧供应商与逐次外发确认描述仅作为历史基线保留。
 
+2026-10-13 更新（部署拓扑）：下文关于 Redis/RQ 独立队列与多服务分离 worker 的拓扑是评审阶段的设想方案，**并非当前实现**。现行实现为单进程、单 Uvicorn worker，生成队列驻留进程内存、数据库为唯一持久真相，回收站到期清理与进程重启后的任务补偿都由应用自身在启动/关闭时完成。以 [ADR-0012](adr/0012-single-process-trash-maintenance-and-worker-recovery.md) 与 [ADR-0009](adr/0009-work-input-lock-during-generation.md) 为准；本文相关章节仅作历史基线保留。
+
 状态：技术评审后基线。本文将已确认的产品规则转换为首版可实现的接口、数据和验收约束。没有既有代码或技术栈，因此技术选型属于建议方案。
 
-> **2026-10-24 漂移标注（当前实现基线）**
-> 本文保留历史设计原文；凡与当前代码不一致之处，以代码为准。当前实现边界是：单进程 / 单 worker / 单实例；显式保存版本当前仅 OWNER 有入口，EDITOR 显式保存是产品待定项 pending；发布正式稿与创建导出仅 OWNER；导出下载要求 active 作品成员和未过期 token；回收站 30 天是恢复截止，永久清理仅管理员手动触发。下文在对应漂移点列出代码依据，不删除历史原文。
+> **2026-11-21 漂移标注（当前实现基线）**
+> 本文保留历史设计原文；凡与当前代码不一致之处，以代码为准。当前实现边界是：单进程 / 单 worker / 单实例；显式保存版本对 OWNER 与 EDITOR 开放；发布正式稿与创建导出仅 OWNER；导出下载要求 active 作品成员和未过期 token；回收站 30 天是恢复截止与永久清理期限，应用启动时和进程内维护线程约每日自动清理到期作品，管理员也可手动触发。下文在对应漂移点列出代码依据，不删除历史原文。
 
 ## 1. 首版目标
 
@@ -37,12 +39,12 @@
 | 部署 | Docker Compose | `web`、`api`、`worker`、`postgres`、`redis`、`storage`；健康检查和迁移入口固定 |
 
 > **漂移标注（2026-10-24，技术栈与部署）**
-> 表格中的 Redis、ARQ worker、六服务 Compose、Docker Secret 以及“没有既有代码”均为历史建议。当前仅 `db` 与 `app` 两个 Compose 服务（`docker-compose.yml:1-44`）；应用由单个 Uvicorn 进程启动（`Dockerfile:22-23`）；后台生成使用进程内单线程、内存队列和互斥锁（`app/worker.py:1-38`），没有 Redis/ARQ/RQ，不能据此设计多 worker 或水平扩展。凭证加密使用 AES-GCM（`app/crypto.py:11-22`），主密钥来自 `APP_EXTERNAL_ENCRYPTION_KEY`；production 要求稳定、至少 32 字符且非默认值（`app/config.py:22,34-37`），密钥轮换会使历史密文无法解密。逐次外发确认已由 ADR-0011 替代。
+> 表格中的 Redis、ARQ worker、六服务 Compose、Docker Secret 以及“没有既有代码”均为历史建议。当前 Compose 仅有 `db` 与 `app` 服务（`docker-compose.yml`）；应用由单个 Uvicorn 进程启动（`Dockerfile`）；后台生成使用进程内单线程、内存队列和互斥锁（`app/worker.py::GenerationWorker`），没有 Redis/ARQ/RQ，不能据此设计多 worker 或水平扩展。凭证加密使用 AES-GCM（`app/crypto.py::encrypt_secret`），主密钥来自 `APP_EXTERNAL_ENCRYPTION_KEY`；production 要求稳定、至少 32 字符且非默认值（`app/config.py::Settings`），密钥轮换会使历史密文无法解密。逐次外发确认已由 ADR-0011 替代。
 
 2026-10-13 前端细化见[页面设计](frontend-page-design.md)与[开发方案](frontend-development-plan.md)。用户已确认完整页面范围、桌面优先且手机可操作、连续结构化正文编辑、编辑者显式保存版本、上游设定变更后的下游重新确认、正文生成期间的作品输入及外部对话锁定，以及作品内预览链接完成异地外发确认；相关 API 行为需补齐。相关 ADR 为 0007-0010，独立开发任务见[前端任务规格](../.scratch/frontend-experience/spec.md)。
 
-> **漂移标注（2026-10-24，角色与外发）**
-> 本段中的“编辑者显式保存版本”和预览链接外发确认属于历史访谈口径。当前显式保存版本入口仅 OWNER（`app/features.py:391-400`）；EDITOR 显式保存为产品待定项 pending，当前无对应入口。逐次外发确认由 ADR-0011 替代，创作对话和正文生成不再走该审批门禁。
+> **漂移标注（2026-11-21，角色与外发）**
+> 本段中的“编辑者显式保存版本”已由 CALL-6 FEAT-01 落地；预览链接外发确认仍是历史访谈口径。当前 OWNER 与 EDITOR 均可显式保存版本（`app/features.py::create_version`）。逐次外发确认由 ADR-0011 替代，创作对话和正文生成不再走该审批门禁。
 
 ## 3. 领域模型与关键约束
 
@@ -64,7 +66,7 @@
 所有作品查询必须经过 `WorkAccessService`. 资源 API 不接受调用方自带的 owner/member 字段作为授权依据。回收站作品不能被普通列表或生成 API 看到。
 
 > **漂移标注（2026-10-24，统一授权）**
-> 代码中不存在 `WorkAccessService` 类；上述名称仅为历史设计术语。当前统一入口是 `_require_work_member`（`app/main.py:444-468`），并由 `_require` 包装复用（`app/features.py:295-296`）。它校验 ACCEPTED 成员关系、作品非回收站状态和角色集合，管理员没有作品授权绕过分支。
+> 代码中不存在 `WorkAccessService` 类；上述名称仅为历史设计术语。当前统一入口是 `_require_work_member`（`app/main.py::_require_work_member`），并由 `_require` 包装复用（`app/features.py::_require`）。它校验 ACCEPTED 成员关系、作品非回收站状态和角色集合，管理员没有作品授权绕过分支。
 
 ### 3.3 创作决策和版本
 
@@ -77,8 +79,8 @@
 
 恢复旧版本不是覆盖，而是基于旧版本创建新的 `work_version`，并递增作品 `revision`。任何写操作使用 `expected_revision`；不匹配返回 `409 WORK_REVISION_CONFLICT`。
 
-> **漂移标注（2026-10-24，表名、版本与错误码）**
-> 当前表名是 `script_versions`（`app/models.py:198-215`）和 `script_releases`（`app/models.py:216-231`）；确认设定保存在 `work_creative_data`（`app/models.py:143-163`），不存在 `locked_decisions` 表。显式保存版本当前仅 OWNER 可调用（`app/features.py:391-400`），恢复仅 OWNER（`app/features.py:434-443`），发布正式稿仅 OWNER（`app/features.py:450-464`）；EDITOR 显式保存为产品待定项 pending。并发写冲突的稳定错误码是 `REVISION_CONFLICT`，不是 `WORK_REVISION_CONFLICT`（`app/features.py:380-382,754-775`）。
+> **漂移标注（2026-11-21，表名、版本与错误码）**
+> 当前表名是 `script_versions`（`app/models.py::ScriptVersion`）和 `script_releases`（`app/models.py::ScriptRelease`）；确认设定保存在 `work_creative_data`（`app/models.py::WorkCreativeData`），不存在 `locked_decisions` 表。显式保存版本对 OWNER 与 EDITOR 开放（`app/features.py::create_version`），恢复仅 OWNER（`restore_version`），发布正式稿仅 OWNER（`publish_version`）。并发写冲突的稳定错误码是 `REVISION_CONFLICT`（`_create_version`、`create_generation_job`），不是 `WORK_REVISION_CONFLICT`。
 
 ### 3.4 模型与外发授权
 
@@ -91,7 +93,7 @@
 外发确认至少绑定：作品、模型配置版本、发送的数据类别（对话/设定/大纲/正文）、输入 revision。供应商、模型、数据类别、输入 revision 或作品所有者撤销后，确认立即失效。
 
 > **漂移标注（2026-10-24，模型与外发）**
-> 当前表名为 `external_consents`（`app/models.py:281-294`），没有创建/撤销外发确认的当前 API；ADR-0011 已取消逐次外发确认门禁。正文生成由 OWNER/EDITOR 直接发起（`app/features.py:742-792`），但仍要求全阶段设定已确认、同作品串行、幂等键和 `input_revision` 冲突检测；错误码使用 `REVISION_CONFLICT`。
+> 当前保留历史表 `external_consents`（`app/models.py::ExternalConsent`），没有创建/撤销外发确认的当前 API；ADR-0011 已取消逐次外发确认门禁。正文生成由 OWNER/EDITOR 直接发起（`app/features.py::create_generation_job`），但仍要求全阶段设定已确认、同作品串行、幂等键和 `input_revision` 冲突检测；错误码使用 `REVISION_CONFLICT`。
 
 ## 4. API 边界
 
@@ -160,7 +162,7 @@
 > - 提案：`GET/POST /api/v1/works/{work_id}/change-proposals` 及 `/{proposal_id}/approve|reject`；
 > - 版本与发布：`POST /api/v1/works/{work_id}/versions`、`POST /api/v1/works/{work_id}/versions/{version_id}/restore`、`POST /api/v1/works/{work_id}/releases`；
 > - 生成与导出：`POST /api/v1/works/{work_id}/generation-jobs`、`POST /api/v1/works/{work_id}/exports`；下载为 `GET /api/v1/exports/{export_id}/download?token=...`。
-> 当前不存在 `external-consents` 创建/撤销路由；模型调用按 ADR-0011 由作品成员直接发起。版本相关代码依据见 `app/features.py:391-464,742-792,874-900,1126-1138`。
+> 当前不存在 `external-consents` 创建/撤销路由；模型调用按 ADR-0011 由作品成员直接发起。版本、生成、发布与导出依据见 `app/features.py::create_version`、`create_generation_job`、`restore_version`、`publish_version`、`create_export` 和 `download_export`。
 
 内部模型适配器接口：
 
@@ -191,7 +193,7 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 - worker 崩溃由租约超时恢复为 `QUEUED`，重试次数有限并记录 attempt。
 
 > **漂移标注（2026-10-24，worker 恢复）**
-> 当前没有租约超时或 `QUEUED` 自动恢复机制。进程启动时把遗留 `RUNNING` 任务标记为 `FAILED` / `WORKER_INTERRUPTED`，仅把数据库中的 `QUEUED` 任务重新入内存队列（`app/main.py:634-649`）；进程退出时停止 worker 并收口在途调用（`app/main.py:650-656`）。队列不跨进程持久化，因此该行为只适用于单实例。
+> 当前没有租约超时机制。进程启动时由 `app/lifecycle.py::recover_generation_state` 把遗留 `RUNNING` 任务标记为 `FAILED` / `WORKER_INTERRUPTED`，校验后将仍有效的 `QUEUED` 任务重新入内存队列；关闭时由 `app/main.py::lifespan` 停止 worker 和维护线程。队列不跨进程持久化，因此该行为只适用于单实例。
 
 ### 5.2 ChangeProposal
 
@@ -201,8 +203,8 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 
 `ACTIVE -> TRASHED -> ACTIVE`，或 `TRASHED -> PURGED`。普通资源查询过滤 `TRASHED`；回收站恢复和永久删除需要所有者操作和审计记录。每日清理任务只处理超过 30 天的回收站作品。
 
-> **漂移标注（2026-10-24，回收站）**
-> 当前作品状态只有 `ACTIVE` / `TRASHED`，没有 `PURGED` 状态，也没有每日自动清理任务。30 天是恢复截止：仅 OWNER 可恢复，超期返回 `TRASH_RETENTION_EXPIRED`（`app/main.py:1341-1355`）。永久清理仅管理员手动调用 `POST /api/v1/admin/trash/purge`，该端点只删除已超过保留期的回收站作品并写审计（`app/features.py:1112-1124`）。
+> **漂移标注（2026-11-21，回收站）**
+> 当前作品状态只有 `ACTIVE` / `TRASHED`，没有 `PURGED` 状态，但永久清理已自动执行。30 天同时是恢复截止和清理期限：仅 OWNER 可恢复，超期返回 `TRASH_RETENTION_EXPIRED`（`app/main.py::restore_work`）；应用启动时先清理一次，随后进程内维护线程约每 24 小时清理到期作品（`app/main.py::lifespan`、`app/lifecycle.py::_tick_interval_seconds`、`purge_expired_works`、`start_trash_maintenance`）。管理员还可手动调用 `POST /api/v1/admin/trash/purge`，清理操作写审计（`app/features.py::purge_expired_trash`）。
 
 ## 6. Docker Compose 与运维
 
@@ -225,7 +227,7 @@ classify_error(error) -> TRANSIENT | RATE_LIMIT | AUTH | INVALID_REQUEST | CONTE
 - 端到端验收：创建账号 → 创建作品 → 确认设定 → 外发确认 → 分段生成 → 版本恢复 → 发布 → Markdown/DOCX 导出 → 回收站恢复。
 
 > **漂移标注（2026-10-24，验收）**
-> 上述端到端步骤中的“外发确认”已经过时，应改为成员直接调用已启用模型；“30 天清理”也不应作为自动任务验收项，应验证 30 天恢复截止和管理员手动 purge 端点（`app/features.py:1112-1124`）。
+> 上述端到端步骤中的“外发确认”已经过时，应改为成员直接调用已启用模型；回收站验收应覆盖 30 天恢复截止、应用启动/进程内维护线程自动清理，以及管理员手动 purge 端点（`app/main.py::lifespan`、`app/lifecycle.py::purge_expired_works` / `start_trash_maintenance`、`app/features.py::purge_expired_trash`）。
 
 ## 8. 分阶段开发任务
 

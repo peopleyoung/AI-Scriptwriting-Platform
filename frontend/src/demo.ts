@@ -203,6 +203,7 @@ export function seedWorks(): Work[] {
       content: structuredClone(draft),
       created_at: now,
       work_revision: 1,
+      author_display_name: demoUser.username,
     };
     return {
       id: `demo-${i}`,

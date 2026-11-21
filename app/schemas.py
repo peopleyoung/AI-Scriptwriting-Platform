@@ -229,6 +229,7 @@ class ScriptVersionResponse(BaseModel):
     work_id: str
     source: str
     author_user_id: str | None
+    author_display_name: str | None = None
     parent_version_id: str | None
     content: dict[str, Any]
     content_hash: str
@@ -340,6 +341,7 @@ class GenerationJobResponse(BaseModel):
     target_path: dict[str, Any]
     status: str
     retry_count: int
+    retry_of_job_id: str | None = None
     error_code: str | None
     error_message: str | None
     result_version_id: str | None
@@ -363,4 +365,8 @@ class ExportJobResponse(BaseModel):
     download_expires_at: datetime | None = None
     error_code: str | None = None
     created_at: datetime
+
+
+class RuntimeConfigResponse(BaseModel):
+    trash_retention_days: int
 

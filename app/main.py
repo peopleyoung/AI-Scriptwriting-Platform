@@ -41,6 +41,7 @@ from app.schemas import (
     ResetPasswordRequest,
     SetActiveRequest,
     TransferOwnershipRequest,
+    RuntimeConfigResponse,
     CreativeResponse,
     TemplateCreateRequest,
     TemplateResponse,
@@ -632,28 +633,23 @@ async def lifespan(app: FastAPI):
                 _audit(db, "ADMIN_BOOTSTRAPPED", target=admin)
                 db.commit()
     worker = app.state.generation_worker
-    with app.state.session_factory() as db:
-        from app.models import GenerationJob, CreativeConversation, WorkAIActivity
-        # Interrupted requests require a fresh explicit retry; queued work resumes.
-        for job in db.scalars(select(GenerationJob).where(GenerationJob.status == "RUNNING")).all():
-            job.status = "FAILED"
-            job.error_code = "WORKER_INTERRUPTED"
-            job.finished_at = datetime.now(timezone.utc)
-            release(db, job.work_id, job.id)
-        for row in db.scalars(select(CreativeConversation).where(CreativeConversation.status.in_(["QUEUED", "RUNNING"]))).all():
-            finish_conversation(db, row, "INCOMPLETE", "WORKER_INTERRUPTED")
-        queued_ids = list(db.scalars(select(GenerationJob.id).where(GenerationJob.status == "QUEUED")))
-        db.commit()
+    # Startup recovery and the first sweep finish before the app serves traffic.
+    from app import lifecycle
+    lifecycle.purge_expired_works(app.state.session_factory, settings.trash_retention_days)
+    queued_ids = lifecycle.recover_generation_state(app.state.session_factory)
+    maintenance_thread, maintenance_stop = lifecycle.start_trash_maintenance(app.state.session_factory, settings)
     worker.start()
     for job_id in queued_ids:
         worker.enqueue(job_id)
     try:
         yield
     finally:
+        # Normal shutdown keeps QUEUED jobs QUEUED; unfinished RUNNING jobs are
+        # resolved to WORKER_INTERRUPTED on the next startup. Never cancel the
+        # pending queue here.
         worker.stop()
-        with app.state.session_factory() as db:
-            cancel_calls(db, code="SERVER_STOPPED")
-            db.commit()
+        maintenance_stop.set()
+        maintenance_thread.join(timeout=2)
         app.state.engine.dispose()
 
 
@@ -1346,20 +1342,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ) -> WorkResponse:
         _check_csrf(request)
-        work, _ = _require_work_member(db, owner, work_id, {"OWNER"}, allow_trashed=True)
-        if work.status != "TRASHED":
-            raise _error("WORK_NOT_TRASHED", "work is not in the trash", status.HTTP_409_CONFLICT)
-        if work.trashed_at is not None:
-            trashed_at = work.trashed_at if work.trashed_at.tzinfo else work.trashed_at.replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - trashed_at).total_seconds() > app_settings.trash_retention_days * 86400:
+        from app import lifecycle
+        with lifecycle.lifecycle_guard():
+            work, _ = _require_work_member(db, owner, work_id, {"OWNER"}, allow_trashed=True)
+            if work.status != "TRASHED":
+                raise _error("WORK_NOT_TRASHED", "work is not in the trash", status.HTTP_409_CONFLICT)
+            if lifecycle.is_expired(work.trashed_at, app_settings.trash_retention_days):
                 raise _error("TRASH_RETENTION_EXPIRED", "the work can no longer be restored", status.HTTP_410_GONE)
-        now = datetime.now(timezone.utc)
-        work.status = "ACTIVE"
-        work.trashed_at = None
-        work.updated_at = now
-        work.revision += 1
-        _audit(db, "WORK_RESTORED", actor=owner, metadata={"work_id": work.id})
-        db.commit()
+            now = datetime.now(timezone.utc)
+            work.status = "ACTIVE"
+            work.trashed_at = None
+            work.updated_at = now
+            work.revision += 1
+            _audit(db, "WORK_RESTORED", actor=owner, metadata={"work_id": work.id})
+            db.commit()
         return _work_response(work)
 
     register_feature_routes(
@@ -1418,6 +1414,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/auth/me", response_model=UserResponse)
     def me(user: Annotated[User, Depends(active_user)]) -> UserResponse:
         return _public_user(user)
+
+    @app.get("/api/v1/runtime-config", response_model=RuntimeConfigResponse)
+    def runtime_config(user: Annotated[User, Depends(active_user)]) -> RuntimeConfigResponse:
+        return RuntimeConfigResponse(trash_retention_days=app_settings.trash_retention_days)
 
     @app.post("/api/v1/auth/change-password", response_model=UserResponse)
     @app.post("/api/v1/change-password", response_model=UserResponse, include_in_schema=False)

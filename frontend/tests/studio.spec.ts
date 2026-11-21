@@ -187,18 +187,24 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
   request,
   browser,
 }) => {
-  await api(request, "/admin/bootstrap", "POST", {
-    username: "browseradmin",
-    password: "Browser-password-123",
+  // Tolerant bootstrap (matches zz-model-chat.spec.ts and the recovery case
+  // below): specs share one disposable database, so the admin may already
+  // exist when another spec provisioned it first.
+  const boot = await request.post("/api/v1/admin/bootstrap", {
+    data: { username: "browseradmin", password: "Browser-password-123" },
   });
   await api(request, "/auth/login", "POST", {
     username: "browseradmin",
-    password: "Browser-password-123",
+    password:
+      boot.status() === 201
+        ? "Browser-password-123"
+        : "Browser-password-123-changed",
   });
-  await api(request, "/auth/change-password", "POST", {
-    current_password: "Browser-password-123",
-    new_password: "Browser-password-123-changed",
-  });
+  if (boot.status() === 201)
+    await api(request, "/auth/change-password", "POST", {
+      current_password: "Browser-password-123",
+      new_password: "Browser-password-123-changed",
+    });
   for (const username of ["browserowner", "browserviewer", "browsereditor"])
     await api(request, "/admin/users", "POST", {
       username,
@@ -252,6 +258,10 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
     "这个版本要交付。",
   );
   await page.getByRole("button", { name: "回到写作", exact: true }).click();
+  // Select this test's mock-backed model explicitly: other specs register
+  // additional model configs on the shared backend, so the default choice is
+  // no longer guaranteed to be "浏览器测试模型".
+  await page.getByLabel("创作模型").selectOption({ label: "浏览器测试模型 · v1" });
   await page.getByLabel("创作对话内容").fill("人物应该怎样出场？");
   await page.getByRole("button", { name: "发送创作对话" }).click();
   await expect(
@@ -326,9 +336,19 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
       await collaborator
         .getByRole("button", { name: "版本", exact: true })
         .click();
+      // FEAT-01: an EDITOR can now save a whole-work version; restoring a
+      // version stays owner-only, so that control is absent for the editor.
+      const saveButton = collaborator.getByRole("button", {
+        name: "保存当前版本",
+      });
+      await expect(saveButton).toBeVisible();
       await expect(
-        collaborator.getByRole("button", { name: "保存当前版本" }),
+        collaborator.getByRole("button", { name: "恢复此版本" }),
       ).toHaveCount(0);
+      await saveButton.click();
+      await expect(collaborator.locator(".toast")).toContainText(
+        "已保存整部作品版本。",
+      );
     }
     await context.close();
   }

@@ -6,4 +6,4 @@
 
 2026-10-13 补充：所有者与编辑者均可显式保存版本；恢复、发布及导出仍由所有者执行。上游变更后的下游重新确认见 [ADR-0008](0008-downstream-reconfirmation-after-setting-change.md)，正文生成期间的输入与外部对话锁定见 [ADR-0009](0009-work-input-lock-during-generation.md)。
 
-2026-10-24 当前实现校正：上文 2026-10-13 的“所有者与编辑者均可显式保存版本”是历史访谈口径，不代表当前入口。当前 `POST /api/v1/works/{work_id}/versions` 仅 OWNER 可调用（`app/features.py:391-400`）；EDITOR 显式保存版本为产品待定项 pending，当前无对应入口。版本恢复、正式稿发布和创建导出仍为 OWNER（`app/features.py:434-464,874-877`）；导出下载由 active 作品成员凭未过期 token 完成（`app/features.py:1126-1138`）。
+2026-11-21 当前实现校正：上文 2026-10-13 的“所有者与编辑者均可显式保存版本”已由 CALL-6 FEAT-01 落地。`POST /api/v1/works/{work_id}/versions` 对 OWNER 与 EDITOR 开放（`app/features.py::create_version`）；版本恢复、正式稿发布和创建导出仍仅限 OWNER（`restore_version`、`publish_version`、`create_export`），导出下载由 active 作品成员凭未过期 token 完成（`download_export`）。

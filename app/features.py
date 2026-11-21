@@ -126,6 +126,7 @@ def _version_response(version: ScriptVersion) -> ScriptVersionResponse:
         work_id=version.work_id,
         source=version.source,
         author_user_id=version.author_user_id,
+        author_display_name=version.author.username if version.author else None,
         parent_version_id=version.parent_version_id,
         content=version.content_json,
         content_hash=version.content_hash,
@@ -159,6 +160,7 @@ def _job_response(job: GenerationJob) -> GenerationJobResponse:
         target_path=job.target_path_json or {},
         status=job.status,
         retry_count=job.retry_count,
+        retry_of_job_id=job.retry_of_job_id,
         error_code=job.error_code,
         error_message=job.error_message,
         result_version_id=job.result_version_id,
@@ -337,7 +339,7 @@ def register_feature_routes(
             "generation_jobs": [_job_response(item).model_dump() for item in jobs],
             "ai_activity": activity_response(db, work.id),
             "releases": [_release_response(item).model_dump() for item in releases],
-            "permissions": {"can_edit": member.role in {"OWNER", "EDITOR"}, "can_confirm": member.role == "OWNER", "can_publish": member.role == "OWNER", "can_export": member.role == "OWNER"},
+            "permissions": {"can_edit": member.role in {"OWNER", "EDITOR"}, "can_save_version": member.role in {"OWNER", "EDITOR"}, "can_restore_version": member.role == "OWNER", "can_confirm": member.role == "OWNER", "can_publish": member.role == "OWNER", "can_export": member.role == "OWNER"},
         }
 
     @app.patch("/api/v1/works/{work_id}/draft")
@@ -392,7 +394,7 @@ def register_feature_routes(
     @app.post("/api/v1/works/{work_id}/script/save", response_model=ScriptVersionResponse, include_in_schema=False)
     def create_version(work_id: str, payload: VersionCreateRequest, request: Request, user: User = Depends(active_user), db: Session = Depends(get_db)):
         check_csrf(request)
-        work, _ = _require(db, user, work_id, {"OWNER"})
+        work, _ = _require(db, user, work_id, {"OWNER", "EDITOR"})
         content = deepcopy(payload.content if payload.content is not None else (work.draft_json or {}))
         parent = db.scalar(select(ScriptVersion).where(ScriptVersion.work_id == work.id).order_by(ScriptVersion.created_at.desc()))
         version = _create_version(db, work, user, content, "MANUAL_SAVE", parent.id if parent else None, payload.expected_revision)
@@ -835,7 +837,7 @@ def register_feature_routes(
         db.commit()
         return _job_response(job)
 
-    @app.post("/api/v1/works/{work_id}/generation-jobs/{job_id}/retry", response_model=GenerationJobResponse)
+    @app.post("/api/v1/works/{work_id}/generation-jobs/{job_id}/retry", response_model=GenerationJobResponse, status_code=status.HTTP_201_CREATED)
     def retry_job(work_id: str, job_id: str, request: Request, user: User = Depends(active_user), db: Session = Depends(get_db)):
         check_csrf(request)
         work, _ = _require(db, user, work_id, {"OWNER", "EDITOR"})
@@ -846,30 +848,43 @@ def register_feature_routes(
             raise error("GENERATION_JOB_NOT_RETRYABLE", "only failed generation jobs can be retried", status.HTTP_409_CONFLICT)
         if job.error_code in {"AUTHENTICATION_ERROR", "INVALID_PARAMETERS", "CONTENT_POLICY_ERROR", "REVISION_CONFLICT", "WORK_TRASHED"}:
             raise error("GENERATION_JOB_NOT_RETRYABLE", "this generation failure cannot be retried", status.HTTP_409_CONFLICT)
+        if work.status != "ACTIVE":
+            raise error("WORK_INACTIVE", "the work is not active", status.HTTP_409_CONFLICT)
         if work.revision != job.input_revision:
             raise error("REVISION_CONFLICT", "work changed after the generation request", status.HTTP_409_CONFLICT)
-        if db.scalar(select(GenerationJob.id).where(GenerationJob.work_id == work.id, GenerationJob.id != job.id, GenerationJob.status.in_(["QUEUED", "RUNNING"]))):
+        if db.scalar(select(GenerationJob.id).where(GenerationJob.work_id == work.id, GenerationJob.status.in_(["QUEUED", "RUNNING"]))):
             raise error("AI_ALREADY_RUNNING", "作品已有成员正在调用模型，请稍后发送。", status.HTTP_409_CONFLICT)
         try:
             available_config(db, job.model_config_version_id, new_call=False, lock=True)
-            occupy(db, work.id, "GENERATION", job.id, user.id)
         except ModelAdapterError as exc:
             raise error(exc.code, str(exc), 409)
-        except IntegrityError:
-            db.rollback()
-            raise error("AI_ALREADY_RUNNING", "作品已有模型调用。", 409)
-        job.status = "QUEUED"
-        job.retry_count += 1
-        job.error_code = None
-        job.error_message = None
-        job.finished_at = None
+        # Retry spawns a fresh, trackable job; the original FAILED record is kept immutable.
+        new_job = GenerationJob(
+            work_id=work.id,
+            requested_by_user_id=user.id,
+            idempotency_key=uuid4().hex,
+            input_revision=job.input_revision,
+            target_type=job.target_type,
+            target_path_json=deepcopy(job.target_path_json or {}),
+            instruction=job.instruction,
+            model_config_version_id=job.model_config_version_id,
+            consent_id=job.consent_id,
+            input_snapshot_json=deepcopy(job.input_snapshot_json) if job.input_snapshot_json is not None else None,
+            status="QUEUED",
+            retry_count=job.retry_count + 1,
+            retry_of_job_id=job.id,
+        )
+        db.add(new_job)
         try:
-            db.commit()
+            db.flush()
+            occupy(db, work.id, "GENERATION", new_job.id, user.id)
         except IntegrityError:
             db.rollback()
             raise error("AI_ALREADY_RUNNING", "作品已有成员正在调用模型，请稍后发送。", status.HTTP_409_CONFLICT)
-        app.state.generation_worker.enqueue(job.id)
-        return _job_response(job)
+        audit(db, "GENERATION_JOB_RETRIED", actor=user, metadata={"work_id": work.id, "original_job_id": job.id, "new_job_id": new_job.id})
+        db.commit()
+        app.state.generation_worker.enqueue(new_job.id)
+        return _job_response(new_job)
 
     @app.post("/api/v1/works/{work_id}/exports", response_model=ExportJobResponse, status_code=status.HTTP_201_CREATED)
     def create_export(work_id: str, payload: ExportRequest, request: Request, user: User = Depends(active_user), db: Session = Depends(get_db)):
@@ -924,7 +939,7 @@ def register_feature_routes(
         }
         snapshot["invocations"] = _backup_rows(db, ModelInvocationRecord, ["id", "work_id", "provider_id", "model_config_version_id", "status", "usage_json", "duration_ms", "error_code", "trace_id", "created_at"])
         snapshot["consents"] = _backup_rows(db, ExternalConsent, ["id", "work_id", "input_revision", "model_config_version_id", "data_categories_json", "status", "granted_by_user_id", "created_at", "revoked_at"])
-        snapshot["generation_jobs"] = _backup_rows(db, GenerationJob, ["id", "work_id", "requested_by_user_id", "idempotency_key", "input_revision", "target_type", "target_path_json", "instruction", "model_config_version_id", "consent_id", "input_snapshot_json", "status", "retry_count", "error_code", "error_message", "result_version_id", "created_at", "updated_at", "started_at", "finished_at"])
+        snapshot["generation_jobs"] = _backup_rows(db, GenerationJob, ["id", "work_id", "requested_by_user_id", "idempotency_key", "input_revision", "target_type", "target_path_json", "instruction", "model_config_version_id", "consent_id", "input_snapshot_json", "status", "retry_count", "retry_of_job_id", "error_code", "error_message", "result_version_id", "created_at", "updated_at", "started_at", "finished_at"])
         raw = _crypt_payload(json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(), app_settings)
         digest = hashlib.sha256(raw).hexdigest()
         path = backup_dir / f"backup-{int(time.time())}-{digest[:12]}.json"
@@ -1112,15 +1127,8 @@ def register_feature_routes(
     @app.post("/api/v1/admin/trash/purge")
     def purge_expired_trash(request: Request, actor: User = Depends(admin_user), db: Session = Depends(get_db)):
         check_csrf(request)
-        cutoff = _now() - timedelta(days=app_settings.trash_retention_days)
-        purged = 0
-        for work in db.scalars(select(Work).where(Work.status == "TRASHED", Work.trashed_at.is_not(None))).all():
-            trashed_at = _aware(work.trashed_at)
-            if trashed_at is not None and trashed_at < cutoff:
-                audit(db, "WORK_PERMANENTLY_DELETED", actor=actor, metadata={"work_id": work.id})
-                db.delete(work)
-                purged += 1
-        db.commit()
+        from app import lifecycle
+        purged = lifecycle.purge_expired_works(app.state.session_factory, app_settings.trash_retention_days, actor_user_id=actor.id)
         return {"purged": purged}
 
     @app.get("/api/v1/exports/{export_id}/download", name="download_export")

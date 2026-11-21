@@ -13,4 +13,17 @@
 - 2026-10-13 访谈 Q7 补充确认：排队/运行期间暂停新的外部创作对话发送，保留未发送输入，历史对话仍可阅读。
 - 排队超时、worker 失联和取消需要服务端收口为明确终态，不能依靠浏览器在线维持锁定或释放锁定。
 
-2026-10-24 当前实现说明：本 ADR 中的锁与冲突约束仍有效；涉及角色的部分按当前入口解释：显式保存版本当前仅 OWNER 可调用（`app/features.py:391-400`），EDITOR 显式保存为产品待定项 pending。原文关于“外发确认失效”的历史规则已由 [ADR-0011](0011-direct-model-configuration-and-member-invocation.md) 替代，当前创作对话和正文生成由具备作品编辑权限的成员直接发起。
+## 进程重启与锁自愈（2026-10-13 补充）
+
+平台按单进程、单 Uvicorn worker 部署（见 [ADR-0012](0012-single-process-trash-maintenance-and-worker-recovery.md)），数据库是唯一持久真相；内存中的生成队列在进程重启后必然丢失。为不把重启伪装成任务完成或让锁定永久残留，启动与恢复遵循固定顺序：
+
+- 启动时先做回收站到期物理清理，再执行生成/对话状态补偿，最后才拉起维护线程并对外服务，确保没有任何请求能观察到半恢复状态。
+- 数据库中被标为 RUNNING 的生成任务，其进程内执行体已随重启消失，一律收口为 FAILED / `WORKER_INTERRUPTED` 并释放作品输入锁；创作对话同理收口为 INCOMPLETE / `WORKER_INTERRUPTED`，已流出的部分文本保留、绝不补写为成功。
+- 仍处于 QUEUED 的任务逐个重新校验（作品是否活跃、发起者权限、输入版本、模型配置可用性、外发确认）。失效的置为 CANCELED/FAILED 且不留版本；仍有效的按 `created_at, id` 稳定顺序重新入队，避免同一作品并发抢占。
+- 清理没有任何活跃任务对应、却仍占用输入的孤儿 `WorkAIActivity` 锁行。
+- 失败任务的「重试」不原地复用：新建一条 GenerationJob，通过 `retry_of_job_id` 记录血缘，`retry_count` 递增，并使用全新 `idempotency_key`，防止重放旧幂等结果或串用不同输入版本。
+- 正常关闭只停止接收新工作并结束维护线程，不在关闭路径强行改写任务终态——重启补偿逻辑负责收口，避免关闭中途再次崩溃留下不一致状态。
+
+前端据此把 `WORKER_INTERRUPTED` 文案化为「服务重启导致任务中断，原正文已保留」，并让重试轮询新任务 id 而非失败任务的旧 id。
+
+2026-11-21 当前实现说明：本 ADR 中的锁与冲突约束仍有效。人工显式保存版本对 OWNER 与 EDITOR 开放，恢复与发布正式稿仍仅 OWNER 可执行（`app/features.py::create_version`、`restore_version`、`publish_version`）。原文关于“外发确认失效”的历史规则已由 [ADR-0011](0011-direct-model-configuration-and-member-invocation.md) 替代，当前创作对话和正文生成由具备作品编辑权限的成员直接发起。
