@@ -52,3 +52,45 @@ def test_postgresql_migrations_concurrent_jobs_and_cancellation(monkeypatch):
             assert canceled.status_code==200, canceled.text
             assert run.result(timeout=5).json()['status']=='CANCELED'
         assert client.get(f'/api/v1/works/{work}/versions').json()==[]
+
+
+@pytest.mark.skipif(not os.environ.get('APP_TEST_POSTGRES_URL'), reason='dedicated PostgreSQL database not configured')
+def test_postgresql_upstream_approval_serializes_competing_downstream_approval():
+    url = os.environ['APP_TEST_POSTGRES_URL']
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run([sys.executable, '-m', 'alembic', 'upgrade', 'head'], cwd=root, env={**os.environ, 'APP_DATABASE_URL': url}, check=True, capture_output=True)
+    app = create_app(Settings(database_url=url, auto_create_schema=False, cookie_secure=False, bootstrap_admin_username=None, bootstrap_admin_password=None))
+    with CsrfClient(app) as client:
+        username = 'r4-pg-' + uuid4().hex[:8]
+        assert client.post('/api/v1/admin/bootstrap', json={'username': username, 'password': 'Recovery-password-123'}).status_code == 201
+        _login(client, username, 'Postgres-password-123')
+        work = client.post('/api/v1/works', json={'title': 'R4 concurrent approval'}).json()['id']
+        _confirm_all(client, work)
+        proposals = {}
+        for stage, content in (
+            ('brief', {'theme': '新方向'}),
+            ('outline', {'premise': '新大纲'}),
+        ):
+            response = client.post(f'/api/v1/works/{work}/change-proposals', json={'stage': stage, 'content': content})
+            assert response.status_code == 201, response.text
+            proposals[stage] = response.json()['id']
+
+        def approve(stage):
+            return client.post(f'/api/v1/works/{work}/change-proposals/{proposals[stage]}/approve')
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            upstream = pool.submit(approve, 'brief')
+            downstream = pool.submit(approve, 'outline')
+            responses = {'brief': upstream.result(timeout=10), 'outline': downstream.result(timeout=10)}
+        assert responses['brief'].status_code == 200, responses['brief'].text
+        assert responses['outline'].status_code in {200, 409}, responses['outline'].text
+        creative = client.get(f'/api/v1/works/{work}/creative').json()
+        assert creative['states']['brief'] == 'CONFIRMED'
+        assert creative['confirmed']['brief'] == {'theme': '新方向'}
+        assert creative['states']['outline'] == 'NEEDS_RECONFIRMATION'
+        assert creative['confirmed']['outline'] is None
+        proposal_rows = {row['id']: row for row in client.get(f'/api/v1/works/{work}/change-proposals').json()}
+        outline = proposal_rows[proposals['outline']]
+        assert outline['status'] in {'APPROVED', 'STALE'}
+        if outline['status'] == 'STALE':
+            assert outline['stale_reason'] == 'UPSTREAM_CONFIRMATION_CHANGED'

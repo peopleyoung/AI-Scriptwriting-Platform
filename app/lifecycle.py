@@ -14,10 +14,12 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, select, update
 
 from app.creative_calls import finish_conversation, release
+from app.creative_rules import confirmation_chain_error
 from app.models import (
     AuditLog,
     ChangeProposal,
     CreativeConversation,
+    CreativeConfirmationEvent,
     ExternalConsent,
     ExportJob,
     GenerationJob,
@@ -78,6 +80,7 @@ def _delete_work_rows(db, work_id: str) -> None:
     db.execute(delete(ModelInvocationRecord).where(ModelInvocationRecord.work_id == work_id))
     db.execute(delete(WorkAIActivity).where(WorkAIActivity.work_id == work_id))
     db.execute(delete(ChangeProposal).where(ChangeProposal.work_id == work_id))
+    db.execute(delete(CreativeConfirmationEvent).where(CreativeConfirmationEvent.work_id == work_id))
     db.execute(delete(WorkCreativeData).where(WorkCreativeData.work_id == work_id))
     db.execute(delete(WorkMember).where(WorkMember.work_id == work_id))
     db.execute(delete(Work).where(Work.id == work_id))
@@ -159,6 +162,9 @@ def _queued_job_is_valid(db, job: GenerationJob) -> str | None:
     )
     if requester is None or not requester.is_active or member is None:
         return "WORK_ACCESS_DENIED"
+    creative = db.scalar(select(WorkCreativeData).where(WorkCreativeData.work_id == work.id))
+    if confirmation_chain_error(creative):
+        return "SETTINGS_NOT_CONFIRMED"
     if work.revision != job.input_revision:
         return "REVISION_CONFLICT"
     if job.input_snapshot_json is not None and not isinstance(job.input_snapshot_json, dict):

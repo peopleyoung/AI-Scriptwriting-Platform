@@ -16,7 +16,7 @@ from test_model_migration import migration_url
 from test_versions_generation_export import CsrfClient, _login, _confirm_all
 
 
-@pytest.mark.parametrize('backup_format', [1, 2])
+@pytest.mark.parametrize('backup_format', [1, 2, 3])
 def test_fresh_restore_keeps_models_snapshots_partial_history_jobs_and_no_keys(direct_studio, tmp_path, migration_url, backup_format):
     source, upstream, model, work = direct_studio
     upstream.release.set()
@@ -37,6 +37,14 @@ def test_fresh_restore_keeps_models_snapshots_partial_history_jobs_and_no_keys(d
     assert 'old-key' not in plain and 'credential_ciphertext' not in plain
     snapshot = json.loads(plain)
     assert len(snapshot['generation_jobs']) == 1 and len(snapshot['invocations']) == 3
+    if backup_format < 3:
+        snapshot["format"] = backup_format
+        for row in snapshot.get("creative", []):
+            for key in ["stage_status", "confirmation_source", "confirmation_event_ids", "confirmation_dependencies", "proposal_history_complete"]:
+                row.pop(key, None)
+            row.pop("confirmation_history_complete", None)
+        snapshot.pop("creative_confirmation_events", None)
+        snapshot.pop("change_proposals", None)
     if backup_format == 1:
         # These are the fields the actual format-1 writer included. It did not
         # store call/job attribution, so restore must tolerate their absence.
@@ -47,7 +55,7 @@ def test_fresh_restore_keeps_models_snapshots_partial_history_jobs_and_no_keys(d
         legacy_chat_fields = {'id', 'work_id', 'user_id', 'user_message', 'assistant_message', 'status', 'created_at'}
         snapshot['model_configs'] = [{k: v for k, v in row.items() if k in legacy_config_fields} for row in snapshot['model_configs']]
         snapshot['conversations'] = [{k: v for k, v in row.items() if k in legacy_chat_fields} for row in snapshot['conversations']]
-        raw = encrypt_bytes(json.dumps(snapshot, ensure_ascii=False).encode(), source.app.state.settings.external_encryption_key)
+    raw = encrypt_bytes(json.dumps(snapshot, ensure_ascii=False).encode(), source.app.state.settings.external_encryption_key)
     fresh_path = tmp_path / 'fresh'
     fresh_path.mkdir()
     artifact = fresh_path / 'copy.json'
@@ -67,18 +75,28 @@ def test_fresh_restore_keeps_models_snapshots_partial_history_jobs_and_no_keys(d
         _login(restored, 'admin', 'Admin-password-123-changed')
         rows = restored.get(f'/api/v1/works/{work}/conversations').json()
         assert [(x['id'], x['status'], x['assistant_message']) for x in rows] == [(x['id'], x['status'], x['assistant_message']) for x in conversations]
-        if backup_format == 2:
+        if backup_format >= 2:
             assert [(x['model_config_version_id'], x['model_display_name'], x['context_summary']) for x in rows] == [(x['model_config_version_id'], x['model_display_name'], x['context_summary']) for x in conversations]
             replay = restored.post(f'/api/v1/works/{work}/conversations', json=complete_request)
             assert replay.status_code == 201 and replay.json()['id'] == complete.json()['id']
         else:
             assert all(row['model_config_version_id'] is None for row in rows)
         jobs = restored.get(f'/api/v1/works/{work}/generation-jobs').json()
-        if backup_format == 2:
+        if backup_format >= 2:
             assert jobs[0]['id'] == done['id'] and jobs[0]['result_version_id'] == done['result_version_id']
         else:
             assert jobs == []
         assert restored.get(f'/api/v1/works/{work}/versions').json()[0]['id'] == done['result_version_id']
+        creative = restored.get(f'/api/v1/works/{work}/creative').json()
+        assert all(creative["states"][stage] == "CONFIRMED" for stage in ("brief", "characters", "outline"))
+        if backup_format == 3:
+            assert len(creative["history"]) == 3
+            assert creative["confirmation_history_complete"] is True
+            assert creative["proposal_history_complete"] is True
+        else:
+            assert len(creative["history"]) == 3
+            assert creative["confirmation_history_complete"] is False
+            assert creative["proposal_history_complete"] is False
         assert restored.get(f'/api/v1/works/{work}/ai-activity').json() is None
         assert restored.get('/api/v1/model-configs').json() == []
         configs = restored.get('/api/v1/admin/model-configs').json()

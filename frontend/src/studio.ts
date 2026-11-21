@@ -28,6 +28,8 @@ const errorMessages: Record<string, string> = {
     "作品已有新修改。请重新打开作品后再操作；当前未保存内容仍保留在编辑区。",
   WORK_REVISION_CONFLICT: "作品已有新修改，请重新打开后再操作。",
   SETTINGS_NOT_CONFIRMED: "请先依次确认创作简报、人物与故事大纲。",
+  PROPOSAL_BASE_CHANGED: "此提案依据已过时，原内容已保留。请按当前设定检查后采用为草稿或重新提交。",
+  DRAFT_REPLACEMENT_CONFIRMATION_REQUIRED: "请先确认采用旧提案会替换当前设定草稿。",
   WORK_ACCESS_DENIED: "你没有这部作品的操作权限。",
   CSRF_ORIGIN_REJECTED: "请求来源校验失败，请通过前端代理访问服务。",
   PROPOSAL_ALREADY_PENDING: "这项设定已有待审批提案。",
@@ -385,6 +387,58 @@ export class Studio {
     if (!work.creative[stage])
       throw new Error("请先填写并保存这一阶段的设定。");
     work.creative.confirmed[stage] = clone(work.creative[stage]);
+    work.creative.states ||= {};
+    work.creative.states[stage] = "CONFIRMED";
+    work.creative.history ||= [];
+    work.creative.history.push({
+      id: uid(),
+      stage,
+      event_type: "CONFIRMED",
+      content: clone(work.creative[stage]),
+      source: "OWNER_CONFIRMATION",
+      actor_user_id: this.user.id,
+      confirmed_at: now(),
+      dependencies: {},
+    });
+    const downstream = stage === "brief"
+      ? (["characters", "outline"] as const)
+      : stage === "characters"
+        ? (["outline"] as const)
+        : ([] as const);
+    for (const next of downstream) {
+      if (work.creative.confirmed[next]) {
+        const previous = clone(work.creative.confirmed[next]);
+        work.creative.history.push({
+          id: uid(),
+          stage: next,
+          event_type: "INVALIDATED",
+          content: previous,
+          source: "UPSTREAM_CONFIRMATION_CHANGED",
+          confirmed_at: null,
+          reason: "UPSTREAM_CONFIRMATION_CHANGED",
+          dependencies: {},
+        });
+        delete work.creative.confirmed[next];
+        work.creative.states[next] = "NEEDS_RECONFIRMATION";
+        if (!work.creative[next]) work.creative[next] = previous as never;
+      }
+      for (const proposal of work.proposals) {
+        if (proposal.stage === next && proposal.status === "PENDING") {
+          proposal.status = "STALE";
+          proposal.stale_reason = "UPSTREAM_CONFIRMATION_CHANGED";
+          work.creative.history.push({
+            id: uid(),
+            stage: next,
+            event_type: "PROPOSAL_STALE",
+            content: clone(proposal.content),
+            source: "UPSTREAM_CONFIRMATION_CHANGED",
+            confirmed_at: null,
+            reason: "UPSTREAM_CONFIRMATION_CHANGED",
+            dependencies: {},
+          });
+        }
+      }
+    }
     return this.finish(work);
   }
   async reviewProposal(id: string, proposalId: string, approve: boolean) {
@@ -403,8 +457,88 @@ export class Studio {
         [proposal.stage]: clone(proposal.content),
       });
       work.creative.confirmed[proposal.stage] = clone(proposal.content);
+      work.creative.states ||= {};
+      work.creative.states[proposal.stage] = "CONFIRMED";
+      work.creative.history ||= [];
+      const confirmedEvent = {
+        id: uid(),
+        stage: proposal.stage,
+        event_type: "CONFIRMED",
+        content: clone(proposal.content),
+        source: "APPROVED_PROPOSAL",
+        actor_user_id: this.user.id,
+        confirmed_at: now(),
+        dependencies: {},
+      } as const;
+      work.creative.history.push(confirmedEvent);
+      const downstream = proposal.stage === "brief"
+        ? (["characters", "outline"] as const)
+        : proposal.stage === "characters"
+          ? (["outline"] as const)
+          : ([] as const);
+      for (const stage of downstream) {
+        if (work.creative.confirmed[stage]) {
+          work.creative.history.push({
+            id: uid(),
+            stage,
+            event_type: "INVALIDATED",
+            content: clone(work.creative.confirmed[stage]),
+            source: "UPSTREAM_CONFIRMATION_CHANGED",
+            confirmed_at: null,
+            reason: "UPSTREAM_CONFIRMATION_CHANGED",
+            dependencies: {},
+          });
+          delete work.creative.confirmed[stage];
+          work.creative.states[stage] = "NEEDS_RECONFIRMATION";
+          if (!work.creative[stage])
+            work.creative[stage] = clone(work.creative.history.at(-1)!.content) as never;
+        }
+        for (const candidate of work.proposals) {
+          if (candidate.stage === stage && candidate.status === "PENDING") {
+            candidate.status = "STALE";
+            candidate.stale_reason = "UPSTREAM_CONFIRMATION_CHANGED";
+            work.creative.history.push({
+              id: uid(),
+              stage,
+              event_type: "PROPOSAL_STALE",
+              content: clone(candidate.content),
+              source: "UPSTREAM_CONFIRMATION_CHANGED",
+              confirmed_at: null,
+              reason: "UPSTREAM_CONFIRMATION_CHANGED",
+              dependencies: {},
+            });
+          }
+        }
+      }
     }
     return this.finish(work, approve);
+  }
+  async adoptStaleProposal(id: string, proposalId: string, revision: number) {
+    if (this.mode === "live") {
+      await api(`/works/${id}/change-proposals/${proposalId}/adopt`, "POST", {
+        replace_existing: true,
+        expected_revision: revision,
+      });
+      return this.refresh(id);
+    }
+    const work = this.work(id);
+    const proposal = work.proposals.find((item) => item.id === proposalId);
+    if (!proposal || proposal.status !== "STALE") throw new Error("仅可采用已过时提案的内容。");
+    if (work.creative.confirmed[proposal.stage]) {
+      if (work.proposals.some((item) => item.stage === proposal.stage && item.status === "PENDING"))
+        throw new Error("这项设定已有待审批提案，原内容保持不变。");
+      work.proposals.push({
+        id: uid(),
+        stage: proposal.stage,
+        content: clone(proposal.content),
+        status: "PENDING",
+        submitted_by_user_id: this.user.id,
+        created_at: now(),
+      });
+      return this.finish(work, false);
+    }
+    work.creative[proposal.stage] = clone(proposal.content) as never;
+    return this.finish(work);
   }
   async availableModels() {
     if (this.mode === "live") this.models = await api<Model[]>("/model-configs");

@@ -57,6 +57,22 @@ export interface Creative {
   characters: Character[] | null;
   outline: Outline | null;
   confirmed: Partial<Record<Stage, unknown>>;
+  states?: Partial<Record<Stage, "DRAFT" | "CONFIRMED" | "NEEDS_RECONFIRMATION">>;
+  sources?: Partial<Record<Stage, string>>;
+  confirmation_history_complete?: boolean;
+  proposal_history_complete?: boolean;
+  history?: Array<{
+    id: string;
+    stage: Stage;
+    event_type: string;
+    content: unknown;
+    source: string;
+    actor_user_id?: string | null;
+    confirmed_at?: string | null;
+    recorded_at?: string;
+    dependencies?: Record<string, string>;
+    reason?: string | null;
+  }>;
 }
 export interface Version {
   id: string;
@@ -90,6 +106,10 @@ export interface Proposal {
   stage: Stage;
   content: Brief | Character[] | Outline;
   status: string;
+  stale_reason?: string | null;
+  submitted_by_user_id?: string;
+  created_at?: string;
+  dependencies?: Record<string, string>;
 }
 export interface Member {
   id: string;

@@ -1,8 +1,13 @@
 """Run browser acceptance tests against a disposable database."""
 import os
+import mimetypes
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+
+# Windows may register .js as text/plain, which prevents Chromium from loading
+# Vite's ES modules in the production same-origin browser test.
+mimetypes.add_type("text/javascript", ".js")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 

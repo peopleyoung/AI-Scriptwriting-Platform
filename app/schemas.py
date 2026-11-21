@@ -191,6 +191,11 @@ class CreativeResponse(BaseModel):
     outline: dict[str, Any] | None
     confirmed: dict[str, Any | None]
     revisions: dict[str, int]
+    states: dict[str, str] = Field(default_factory=dict)
+    sources: dict[str, str] = Field(default_factory=dict)
+    history: list[dict[str, Any]] = Field(default_factory=list)
+    confirmation_history_complete: bool = True
+    proposal_history_complete: bool = True
 
 
 class ChangeProposalRequest(BaseModel):
@@ -208,6 +213,8 @@ class ChangeProposalResponse(BaseModel):
     submitted_by_user_id: str
     reviewed_by_user_id: str | None
     rejection_reason: str | None
+    stale_reason: str | None = None
+    dependencies: dict[str, str] = Field(default_factory=dict)
     created_at: datetime
     reviewed_at: datetime | None
 

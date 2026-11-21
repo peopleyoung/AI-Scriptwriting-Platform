@@ -187,6 +187,7 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
   request,
   browser,
 }) => {
+  test.setTimeout(240_000);
   // Tolerant bootstrap (matches zz-model-chat.spec.ts and the recovery case
   // below): specs share one disposable database, so the admin may already
   // exist when another spec provisioned it first.
@@ -242,6 +243,118 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
       page.getByRole("button", { name: "提出设定变更" }),
     ).toBeVisible();
   }
+  const r4Editor = `r4editor${Date.now()}`;
+  await api(request, "/admin/users", "POST", {
+    username: r4Editor,
+    password: "Browser-password-123",
+  });
+  await api(page.request, `/works/${workId}/members/invitations`, "POST", {
+    username: r4Editor,
+    role: "EDITOR",
+  });
+  const r4EditorContext = await browser.newContext();
+  const r4EditorPage = await r4EditorContext.newPage();
+  await login(r4EditorPage, r4Editor, true);
+  await r4EditorPage
+    .getByRole("button", { name: "团队协作", exact: true })
+    .click();
+  await r4EditorPage.getByRole("button", { name: "接受邀请" }).click();
+  await r4EditorPage
+    .getByRole("button", { name: "打开真实接口的故事", exact: true })
+    .click();
+  await r4EditorPage.getByRole("button", { name: "查看设定", exact: true }).click();
+  await r4EditorPage
+    .locator(".modal-tabs")
+    .getByRole("button", { name: "人物设定" })
+    .click();
+  await r4EditorPage
+    .getByRole("button", { name: "提出设定变更", exact: true })
+    .click();
+  await r4EditorPage.getByRole("textbox").first().fill("林知夏");
+  await r4EditorPage.getByRole("button", { name: "提交变更提案" }).click();
+  await r4EditorPage
+    .locator(".modal-tabs")
+    .getByRole("button", { name: "故事大纲" })
+    .click();
+  await r4EditorPage
+    .getByRole("button", { name: "提出设定变更", exact: true })
+    .click();
+  await r4EditorPage.getByRole("textbox").first().fill("迟到的调查线索");
+  await r4EditorPage.getByRole("button", { name: "提交变更提案" }).click();
+  const changedCharacters = (await api(
+    r4EditorPage.request,
+    `/works/${workId}/change-proposals`,
+  )).find((proposal: { stage: string }) => proposal.stage === "characters");
+  await r4EditorPage.getByRole("button", { name: "回到写作", exact: true }).click();
+
+  await page.reload();
+  await page.getByRole("button", { name: "查看设定", exact: true }).click();
+  await page.locator(".modal-tabs").getByRole("button", { name: "创作简报" }).click();
+  await page.getByRole("button", { name: "提出设定变更", exact: true }).click();
+  await page.getByRole("textbox").first().fill("新的调查主题");
+  await page.getByRole("button", { name: "提交变更提案" }).click();
+  await page.getByRole("button", { name: "接受变更", exact: true }).click();
+  const ownerCookies = (await page.request.storageState()).cookies;
+  const ownerCsrf = ownerCookies.find((cookie) => cookie.name === "scriptwriting_csrf");
+  const blockedGeneration = await page.request.fetch(
+    `/api/v1/works/${workId}/generation-jobs`,
+    {
+      method: "POST",
+      data: {
+        model_config_version_id: "unavailable",
+        target_type: "WORK",
+        target_path: {},
+        idempotency_key: `r4-blocked-${Date.now()}`,
+      },
+      headers: ownerCsrf ? { "X-CSRF-Token": ownerCsrf.value } : {},
+    },
+  );
+  expect(blockedGeneration.status()).toBe(409);
+  expect((await blockedGeneration.json()).detail.code).toBe("SETTINGS_NOT_CONFIRMED");
+  await page.getByRole("button", { name: "回到写作", exact: true }).click();
+
+  await r4EditorPage.reload();
+  await r4EditorPage.getByRole("button", { name: "查看设定", exact: true }).click();
+  r4EditorPage.on("dialog", (dialog) => dialog.accept());
+  for (const [stage, value] of [
+    ["人物设定", "林知夏"],
+    ["故事大纲", "迟到的调查线索"],
+  ]) {
+    await r4EditorPage.locator(".modal-tabs").getByRole("button", { name: stage }).click();
+    await expect(
+      r4EditorPage.getByRole("heading", { name: "已过时的提案 · 原内容已保留" }),
+    ).toBeVisible();
+    await expect(r4EditorPage.getByText("待重新确认").first()).toBeVisible();
+    await r4EditorPage
+      .getByRole("button", { name: "采用为草稿或新提案" })
+      .click();
+    await r4EditorPage.getByRole("button", { name: "编辑设定", exact: true }).click();
+    await r4EditorPage.getByRole("textbox").first().fill(value);
+    await r4EditorPage.getByRole("button", { name: "保存设定草稿" }).click();
+  }
+  await r4EditorPage.getByRole("button", { name: "回到写作", exact: true }).click();
+
+  await page.reload();
+  await page.getByRole("button", { name: "查看设定", exact: true }).click();
+  for (const stage of ["人物设定", "故事大纲"]) {
+    await page.locator(".modal-tabs").getByRole("button", { name: stage }).click();
+    await expect(page.getByText("待重新确认").first()).toBeVisible();
+    await page.getByRole("button", { name: "确认此阶段", exact: true }).click();
+  }
+  const reconciledCreative = await api(page.request, `/works/${workId}/creative`);
+  expect(Object.values(reconciledCreative.states)).toEqual([
+    "CONFIRMED",
+    "CONFIRMED",
+    "CONFIRMED",
+  ]);
+  const retainedProposals = await api(page.request, `/works/${workId}/change-proposals`);
+  const retainedCharacterProposal = retainedProposals.find(
+    (proposal: { id: string }) => proposal.id === changedCharacters.id,
+  );
+  expect(retainedCharacterProposal.status).toBe("STALE");
+  expect(retainedCharacterProposal.content).toEqual(changedCharacters.content);
+  await r4EditorContext.close();
+
   await page.getByRole("button", { name: "回到写作", exact: true }).click();
   await page.getByRole("button", { name: "添加第一集" }).click();
   await page.getByLabel("本集标题").fill("第一封信");

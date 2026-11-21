@@ -73,6 +73,12 @@ const sourceNames: Record<string, string> = {
   GENERATION: "生成",
   RESTORE: "恢复",
 };
+const staleProposalReasons: Record<string, string> = {
+  LEGACY_DEPENDENCY_UNVERIFIED: "旧提案提交时的上游依据无法核实。这不表示内容已被证实错误，请按当前设定检查后再采用。",
+  UPSTREAM_CONFIRMATION_CHANGED: "此提案所依据的上游设定已更新，原内容仍保留。",
+  BASE_CHANGED: "本阶段设定在提案提交后已变化，原内容仍保留。",
+  BASE_UNVERIFIED: "此提案无法对应到可核实的当前设定基础，原内容仍保留。",
+};
 const freshFragment = (): Fragment => ({
   id: crypto.randomUUID(),
   blocks: [{ type: "ACTION", text: "" }],
@@ -317,6 +323,13 @@ export default function Workspace({
           setConflict(await studio.refresh(work.id));
         } catch {
           /* Keep the local draft if the remote copy cannot be read. */
+        }
+      }
+      if (err instanceof ApiError && err.code === "PROPOSAL_BASE_CHANGED") {
+        try {
+          apply(await studio.refresh(work.id), true);
+        } catch {
+          /* Keep the current view if the refreshed proposal history cannot be read. */
         }
       }
       return false;
@@ -674,6 +687,9 @@ export default function Workspace({
                 <span className="step-number">{index + 1}</span>
               )}
               {stageNames[s]}
+              {work.creative.states?.[s] === "NEEDS_RECONFIRMATION" && (
+                <small>待重新确认</small>
+              )}
               {index < 2 && <ChevronRight size={12} />}
             </button>
           ))}
@@ -1280,7 +1296,20 @@ export default function Workspace({
             ))}
           </div>
           <div className="notice">
-            {work.creative.confirmed[stage]
+            {work.creative.confirmation_history_complete === false && (
+              <p>此作品仅保留迁移或恢复时可见的确认快照，早期完整确认历史无法核实。</p>
+            )}
+            {work.creative.proposal_history_complete === false && (
+              <p>旧备份未包含完整的变更提案历史；当前列表可能不包含迁移或恢复前的全部提案记录。</p>
+            )}
+            {work.creative.sources?.[stage]?.startsWith("LEGACY") && (
+              <p>旧版确认已保留；迁移前的确认依赖历史不完整。后续上游变更将要求重新确认。</p>
+            )}
+            {work.creative.states?.[stage] === "NEEDS_RECONFIRMATION"
+              ? work.creative.sources?.[stage] === "LEGACY_BASELINE"
+                ? "旧版阶段内容已保留，但提交时的上游依赖无法核实。请检查当前内容并按顺序重新确认。"
+                : "上游设定已更新，此阶段需要重新确认。原内容与草稿已保留；请检查后按顺序重新确认。"
+              : work.creative.confirmed[stage]
               ? "此阶段已确认。修改需要提交变更提案，并经所有者审批。"
               : "当前为设定草稿。所有者依次确认创作简报、人物设定与故事大纲后，才能生成正文。"}
           </div>
@@ -1294,6 +1323,30 @@ export default function Workspace({
             }}
             stage={stage}
           />
+          {(work.creative.history || [])
+            .filter((item) => item.stage === stage)
+            .map((item) => (
+              <article className="proposal" key={item.id}>
+                <h3>
+                  {item.event_type === "INVALIDATED"
+                    ? "已失效的历史确认"
+                    : item.event_type === "LEGACY_BASELINE"
+                      ? "旧版兼容确认基线"
+                      : "历史确认"}
+                </h3>
+                <p className="hint">
+                  {item.event_type === "INVALIDATED"
+                    ? "上游设定变化后保留的历史内容，不再作为生成约束。"
+                    : item.source?.startsWith("LEGACY")
+                      ? "迁移保留的旧确认；迁移前的依赖历史不完整。"
+                      : `确认记录${item.confirmed_at ? ` · ${formatDate(item.confirmed_at)}` : " · 原确认时间未知"}`}
+                </p>
+                <CreativeContent
+                  work={{ ...work, creative: { ...work.creative, [stage]: item.content as never } }}
+                  stage={stage}
+                />
+              </article>
+            ))}
           {work.proposals
             .filter((p) => p.stage === stage && p.status === "PENDING")
             .map((p) => (
@@ -1340,6 +1393,33 @@ export default function Workspace({
                   </div>
                 ) : (
                   <p className="hint">等待作品所有者审批。</p>
+                )}
+              </article>
+            ))}
+          {work.proposals
+            .filter((p) => p.stage === stage && p.status === "STALE")
+            .map((p) => (
+              <article className="proposal" key={p.id}>
+                <h3>已过时的提案 · 原内容已保留</h3>
+                <p className="hint">{staleProposalReasons[p.stale_reason || ""] || "此提案依据已过时，请按当前设定检查后再采用。"}</p>
+                <CreativeContent
+                  work={{ ...work, creative: { ...work.creative, [stage]: p.content } }}
+                  stage={stage}
+                />
+                {editable && (
+                  <Button
+                    small
+                    onClick={() =>
+                      run(async () => {
+                        if (!window.confirm("采用这份旧提案会替换当前设定草稿，或在当前确认有效时创建一份新的待审批提案。是否继续？")) return;
+                        apply(await studio.adoptStaleProposal(work.id, p.id, work.revision));
+                        notify("旧提案内容已作为新草稿或新提案采用，原过时记录保持不变。请检查并按顺序重新确认。 ");
+                      })
+                    }
+                    disabled={busy}
+                  >
+                    采用为草稿或新提案
+                  </Button>
                 )}
               </article>
             ))}

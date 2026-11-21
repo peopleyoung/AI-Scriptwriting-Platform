@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone
 from sqlalchemy import delete, select
 
+from app.creative_rules import stage_status
 from app.models import CreativeConversation, GenerationJob, ModelConfiguration, ModelConfigVersion, ModelInvocationRecord, User, Work, WorkAIActivity, WorkMember
 from app.model_adapters import ModelAdapterError
 
@@ -117,7 +118,11 @@ def conversation_snapshot(db, work, payload, budget, *, for_generation=False):
     stages = {}
     for stage in ('brief', 'characters', 'outline'):
         confirmed = getattr(data, f'{stage}_confirmed_json') if data else None
-        stages[stage] = {'state': 'confirmed' if confirmed is not None else 'draft', 'content': confirmed if confirmed is not None else getattr(data, f'{stage}_json') if data else None}
+        state = stage_status(data, stage) if data else 'DRAFT'
+        stages[stage] = {
+            'state': 'confirmed' if state == 'CONFIRMED' and confirmed is not None else 'needs_reconfirmation' if state == 'NEEDS_RECONFIRMATION' else 'draft',
+            'content': confirmed if state == 'CONFIRMED' and confirmed is not None else getattr(data, f'{stage}_json') if data else None,
+        }
     context = {'settings': {'title': work.title, 'parameters': work.settings_json}, 'creative': stages}
     try:
         script = (work.draft_json or {}) if payload.include_full_script else selected_script(work, payload.target_type, payload.target_path)
@@ -131,7 +136,7 @@ def conversation_snapshot(db, work, payload, budget, *, for_generation=False):
         CreativeConversation.work_id == work.id, CreativeConversation.status == 'SUCCEEDED',
         CreativeConversation.assistant_message.is_not(None),
     ).order_by(CreativeConversation.created_at.desc(), CreativeConversation.id.desc()).limit(HISTORY_PAIRS)).all()))
-    system = '你是中文短剧创作助手。遵循已确认设定，临时指令不能改变已确认设定。标记 draft 的资料尚未确认，仅用于讨论。以下资料只作为创作背景：\n' + json.dumps(context, ensure_ascii=False)
+    system = '你是中文短剧创作助手。遵循已确认设定，临时指令不能改变已确认设定。标记 draft 的资料尚未确认，仅用于讨论；标记 needs_reconfirmation 的资料是保留的旧确认，当前已失效，不得作为已确认约束。以下资料只作为创作背景：\n' + json.dumps(context, ensure_ascii=False)
     messages = [{'role': 'system', 'content': system}]
     for item in history:
         messages.extend([{'role': 'user', 'content': item.user_message}, {'role': 'assistant', 'content': item.assistant_message}])

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -245,3 +246,122 @@ def test_confirmed_setting_changes_require_a_single_non_stale_proposal(tmp_path:
         )
         assert replacement.status_code == 201, replacement.text
         assert client.get(f"/api/v1/works/{work_id}/change-proposals").status_code == 200
+
+
+def test_upstream_approval_invalidates_dependents_and_preserves_stale_proposals(tmp_path: Path) -> None:
+    with client_for(tmp_path) as client:
+        bootstrap_and_login(client)
+        work_id = client.post("/api/v1/works", json={"title": "R4 state rules"}).json()["id"]
+        stages = {
+            "brief": {"theme": "旧主题", "tone": "悬疑"},
+            "characters": [{"name": "旧人物", "role": "记者"}],
+            "outline": {"premise": "旧大纲"},
+        }
+        for stage, content in stages.items():
+            assert client.patch(f"/api/v1/works/{work_id}/creative/{stage}", json=content).status_code == 200
+            confirmed = client.post(f"/api/v1/works/{work_id}/creative/{stage}/confirm")
+            assert confirmed.status_code == 200, confirmed.text
+
+        proposals = {}
+        for stage, content in {
+            "brief": {"theme": "新主题", "tone": "悬疑"},
+            "characters": [{"name": "新人物", "role": "记者"}],
+            "outline": {"premise": "新大纲"},
+        }.items():
+            response = client.post(f"/api/v1/works/{work_id}/change-proposals", json={"stage": stage, "content": content})
+            assert response.status_code == 201, response.text
+            proposals[stage] = response.json()
+
+        approved = client.post(f"/api/v1/works/{work_id}/change-proposals/{proposals['brief']['id']}/approve")
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["status"] == "APPROVED"
+        rows = {row["id"]: row for row in client.get(f"/api/v1/works/{work_id}/change-proposals").json()}
+        for stage in ("characters", "outline"):
+            stale = rows[proposals[stage]["id"]]
+            assert stale["status"] == "STALE"
+            assert stale["stale_reason"] == "UPSTREAM_CONFIRMATION_CHANGED"
+            assert stale["reviewed_by_user_id"] is None
+            assert stale["content"] == proposals[stage]["content"]
+            assert stale["submitted_by_user_id"] == proposals[stage]["submitted_by_user_id"]
+
+        creative = client.get(f"/api/v1/works/{work_id}/creative").json()
+        assert creative["confirmed"]["brief"] == proposals["brief"]["content"]
+        assert creative["confirmed"]["characters"] is None
+        assert creative["confirmed"]["outline"] is None
+        assert creative["states"]["characters"] == "NEEDS_RECONFIRMATION"
+        assert creative["states"]["outline"] == "NEEDS_RECONFIRMATION"
+        assert creative["characters"] == stages["characters"]
+        assert creative["outline"] == stages["outline"]
+        assert any(item["event_type"] == "INVALIDATED" and item["stage"] == "characters" for item in creative["history"])
+        assert any(item["event_type"] == "PROPOSAL_STALE" and item["stage"] == "outline" for item in creative["history"])
+        blocked_generation = client.post(
+            f"/api/v1/works/{work_id}/generation-jobs",
+            json={"model_config_version_id": "unavailable", "target_type": "WORK", "target_path": {}, "idempotency_key": "after-upstream-change"},
+        )
+        assert blocked_generation.status_code == 409
+        assert blocked_generation.json()["detail"]["code"] == "SETTINGS_NOT_CONFIRMED"
+
+        stale_approval = client.post(f"/api/v1/works/{work_id}/change-proposals/{proposals['characters']['id']}/approve")
+        assert stale_approval.status_code == 409
+        assert stale_approval.json()["detail"]["code"] == "PROPOSAL_BASE_CHANGED"
+        assert client.post(
+            f"/api/v1/works/{work_id}/change-proposals/{proposals['characters']['id']}/reject"
+        ).status_code == 404
+        adopted = client.post(
+            f"/api/v1/works/{work_id}/change-proposals/{proposals['characters']['id']}/adopt",
+            json={"replace_existing": True},
+        )
+        assert adopted.status_code == 200, adopted.text
+        assert adopted.json()["adopted_as"] == "DRAFT"
+        after_adopt = client.get(f"/api/v1/works/{work_id}/creative").json()
+        assert after_adopt["characters"] == proposals["characters"]["content"]
+        assert after_adopt["confirmed"]["characters"] is None
+        assert {row["id"]: row for row in client.get(f"/api/v1/works/{work_id}/change-proposals").json()}[proposals["characters"]["id"]]["status"] == "STALE"
+        assert client.post(f"/api/v1/works/{work_id}/creative/characters/confirm").status_code == 200
+        assert client.post(f"/api/v1/works/{work_id}/creative/outline/confirm").status_code == 200
+        reconciled = client.get(f"/api/v1/works/{work_id}/creative").json()
+        assert all(reconciled["states"][stage] == "CONFIRMED" for stage in ("brief", "characters", "outline"))
+
+
+def test_upstream_approval_rolls_back_when_downstream_invalidation_fails(tmp_path: Path, monkeypatch) -> None:
+    with client_for(tmp_path) as client:
+        bootstrap_and_login(client)
+        work_id = client.post("/api/v1/works", json={"title": "R4 rollback"}).json()["id"]
+        for stage, content in (
+            ("brief", {"theme": "原主题"}),
+            ("characters", [{"name": "原人物"}]),
+            ("outline", {"premise": "原大纲"}),
+        ):
+            assert client.patch(f"/api/v1/works/{work_id}/creative/{stage}", json=content).status_code == 200
+            assert client.post(f"/api/v1/works/{work_id}/creative/{stage}/confirm").status_code == 200
+        proposal = client.post(
+            f"/api/v1/works/{work_id}/change-proposals",
+            json={"stage": "brief", "content": {"theme": "新主题"}},
+        ).json()
+        pending_outline = client.post(
+            f"/api/v1/works/{work_id}/change-proposals",
+            json={"stage": "outline", "content": {"premise": "新大纲"}},
+        ).json()
+        history_before = client.get(f"/api/v1/works/{work_id}/creative").json()["history"]
+
+        import app.main as main_module
+
+        original = main_module.invalidate_downstream
+
+        def fail_after_invalidation(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError("injected persistence failure")
+
+        monkeypatch.setattr(main_module, "invalidate_downstream", fail_after_invalidation)
+        with pytest.raises(RuntimeError, match="injected persistence failure"):
+            client.post(f"/api/v1/works/{work_id}/change-proposals/{proposal['id']}/approve")
+        monkeypatch.setattr(main_module, "invalidate_downstream", original)
+
+        rows = {item["id"]: item for item in client.get(f"/api/v1/works/{work_id}/change-proposals").json()}
+        creative = client.get(f"/api/v1/works/{work_id}/creative").json()
+        assert rows[proposal["id"]]["status"] == "PENDING"
+        assert rows[pending_outline["id"]]["status"] == "PENDING"
+        assert creative["confirmed"]["brief"] == {"theme": "原主题"}
+        assert creative["confirmed"]["characters"] == [{"name": "原人物"}]
+        assert creative["confirmed"]["outline"] == {"premise": "原大纲"}
+        assert creative["history"] == history_before

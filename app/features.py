@@ -17,11 +17,12 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request, Response, status
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.creative_calls import available_config, generation_snapshot, occupy, release, activity_response, ensure_editable, cancel_calls
+from app.creative_rules import confirmation_chain_error, record_legacy_baselines
 from app.conversations import conversation_response as _conversation_response, register_conversation_routes
 from app.config import Settings
 from app.crypto import encrypt_bytes, decrypt_bytes, encrypt_secret, decrypt_secret
@@ -29,7 +30,9 @@ from app.db import get_db
 from app.models import (
     AuditLog,
     BackupRecord,
+    ChangeProposal,
     CreativeConversation,
+    CreativeConfirmationEvent,
     ExternalConsent,
     ExportJob,
     GenerationJob,
@@ -275,7 +278,7 @@ def _backup_rows(db, model, fields):
 
 def _restore_values(item):
     values = dict(item)
-    for key in ("created_at", "updated_at", "started_at", "finished_at", "revoked_at"):
+    for key in ("created_at", "updated_at", "started_at", "finished_at", "revoked_at", "confirmed_at", "recorded_at", "reviewed_at"):
         if values.get(key):
             values[key] = datetime.fromisoformat(values[key])
     return values
@@ -332,7 +335,29 @@ def register_feature_routes(
         releases = db.scalars(select(ScriptRelease).where(ScriptRelease.work_id == work.id).order_by(ScriptRelease.created_at)).all()
         return {
             "work": {"id": work.id, "title": work.title, "revision": work.revision, "status": work.status, "role": member.role},
-            "creative": {"brief": work.creative_data.brief_json if work.creative_data else None, "characters": work.creative_data.characters_json if work.creative_data else None, "outline": work.creative_data.outline_json if work.creative_data else None, "confirmed": {stage: getattr(work.creative_data, f"{stage}_confirmed_json") for stage in ("brief", "characters", "outline")} if work.creative_data else {}},
+            "creative": {
+                "brief": work.creative_data.brief_json if work.creative_data else None,
+                "characters": work.creative_data.characters_json if work.creative_data else None,
+                "outline": work.creative_data.outline_json if work.creative_data else None,
+                "confirmed": {stage: getattr(work.creative_data, f"{stage}_confirmed_json") for stage in ("brief", "characters", "outline")} if work.creative_data else {},
+                "states": (work.creative_data.stage_status_json or {}) if work.creative_data else {"brief": "DRAFT", "characters": "DRAFT", "outline": "DRAFT"},
+                "sources": (work.creative_data.confirmation_source_json or {}) if work.creative_data else {},
+                "confirmation_history_complete": work.creative_data.confirmation_history_complete if work.creative_data else False,
+                "proposal_history_complete": work.creative_data.proposal_history_complete if work.creative_data else False,
+                "history": [{
+                    "id": event.id,
+                    "stage": event.stage,
+                    "event_type": event.event_type,
+                    "content": event.content_json,
+                    "source": event.source,
+                    "actor_user_id": event.actor_user_id,
+                    "confirmed_at": event.confirmed_at,
+                    "recorded_at": event.recorded_at,
+                    "dependencies": event.dependencies_json or {},
+                    "reason": event.reason,
+                    "trigger_event_id": event.trigger_event_id,
+                } for event in db.scalars(select(CreativeConfirmationEvent).where(CreativeConfirmationEvent.work_id == work.id).order_by(CreativeConfirmationEvent.recorded_at, CreativeConfirmationEvent.id)).all()],
+            },
             "conversations": [_conversation_response(item).model_dump() for item in conversations],
             "draft": work.draft_json or {},
             "versions": [_version_response(item).model_dump() for item in versions],
@@ -631,6 +656,14 @@ def register_feature_routes(
             job.finished_at = _now()
             release(db, job.work_id, job.id)
             return job
+        confirmation_error = confirmation_chain_error(work.creative_data)
+        if confirmation_error:
+            job.status = "FAILED"
+            job.error_code = "SETTINGS_NOT_CONFIRMED"
+            job.error_message = "creative settings must be re-confirmed before generation"
+            job.finished_at = _now()
+            release(db, job.work_id, job.id)
+            return job
         if work.revision != job.input_revision:
             job.status = "FAILED"
             job.error_code = "REVISION_CONFLICT"
@@ -674,6 +707,9 @@ def register_feature_routes(
                             return True
                         if snapshot.revision != record.input_revision:
                             raise ModelAdapterError("REVISION_CONFLICT", "work changed during generation")
+                        current_creative = state_db.scalar(select(WorkCreativeData).where(WorkCreativeData.work_id == snapshot.id))
+                        if confirmation_chain_error(current_creative):
+                            raise ModelAdapterError("SETTINGS_NOT_CONFIRMED", "creative settings are no longer confirmed")
                         requester = state_db.get(User, record.requested_by_user_id)
                         member = state_db.scalar(select(WorkMember).where(WorkMember.work_id == snapshot.id, WorkMember.user_id == record.requested_by_user_id, WorkMember.status == "ACCEPTED", WorkMember.role.in_(["OWNER", "EDITOR"])))
                         if requester is None or not requester.is_active or member is None:
@@ -704,6 +740,9 @@ def register_feature_routes(
                 return job
             if work.revision != job.input_revision:
                 raise ModelAdapterError("REVISION_CONFLICT", "work changed during generation")
+            current_creative = db.scalar(select(WorkCreativeData).where(WorkCreativeData.work_id == work.id))
+            if confirmation_chain_error(current_creative):
+                raise ModelAdapterError("SETTINGS_NOT_CONFIRMED", "creative settings are no longer confirmed")
             requester = db.get(User, job.requested_by_user_id)
             if not requester.is_active:
                 raise ModelAdapterError("WORK_ACCESS_DENIED", "requesting account is unavailable")
@@ -756,7 +795,7 @@ def register_feature_routes(
         if payload.expected_revision is not None and payload.expected_revision != work.revision:
             raise error("REVISION_CONFLICT", "work revision has changed", 409)
         data = work.creative_data
-        if data is None or any(getattr(data, f"{stage}_confirmed_json") is None for stage in ("brief", "characters", "outline")):
+        if confirmation_chain_error(data):
             raise error("SETTINGS_NOT_CONFIRMED", "all creative stages must be confirmed before generation", status.HTTP_409_CONFLICT)
         required_path = {"WORK": (), "EPISODE": ("episode",), "SCENE": ("episode", "scene"), "FRAGMENT": ("episode", "scene", "fragment")}[payload.target_type]
         if any(key not in payload.target_path for key in required_path):
@@ -850,6 +889,8 @@ def register_feature_routes(
             raise error("GENERATION_JOB_NOT_RETRYABLE", "this generation failure cannot be retried", status.HTTP_409_CONFLICT)
         if work.status != "ACTIVE":
             raise error("WORK_INACTIVE", "the work is not active", status.HTTP_409_CONFLICT)
+        if confirmation_chain_error(work.creative_data):
+            raise error("SETTINGS_NOT_CONFIRMED", "all creative stages must be confirmed before generation", 409)
         if work.revision != job.input_revision:
             raise error("REVISION_CONFLICT", "work changed after the generation request", status.HTTP_409_CONFLICT)
         if db.scalar(select(GenerationJob.id).where(GenerationJob.work_id == work.id, GenerationJob.status.in_(["QUEUED", "RUNNING"]))):
@@ -922,7 +963,7 @@ def register_feature_routes(
         backup_dir = Path(app_settings.backup_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
         snapshot = {
-            "format": 2,
+            "format": 3,
             "created_at": _now().isoformat(),
             "users": [{"id": item.id, "username": item.username, "password_hash": item.password_hash, "role": item.role, "is_active": item.is_active, "must_change_password": item.must_change_password} for item in db.scalars(select(User)).all()],
             "templates": [{"id": item.id, "slug": item.slug, "name": item.name, "status": item.status} for item in db.scalars(select(ScriptTemplate)).all()],
@@ -931,7 +972,9 @@ def register_feature_routes(
             "versions": [{"id": item.id, "work_id": item.work_id, "source": item.source, "author_user_id": item.author_user_id, "parent_version_id": item.parent_version_id, "content": item.content_json, "content_hash": item.content_hash, "work_revision": item.work_revision} for item in db.scalars(select(ScriptVersion)).all()],
             "releases": [{"id": item.id, "work_id": item.work_id, "version_id": item.version_id, "released_by_user_id": item.released_by_user_id, "is_current": item.is_current} for item in db.scalars(select(ScriptRelease)).all()],
             "members": [{"work_id": item.work_id, "user_id": item.user_id, "role": item.role, "status": item.status, "invited_at": item.invited_at.isoformat() if item.invited_at else None, "accepted_at": item.accepted_at.isoformat() if item.accepted_at else None, "revoked_at": item.revoked_at.isoformat() if item.revoked_at else None} for item in db.scalars(select(WorkMember)).all()],
-            "creative": [{"work_id": item.work_id, "brief": item.brief_json, "characters": item.characters_json, "outline": item.outline_json, "brief_confirmed": item.brief_confirmed_json, "characters_confirmed": item.characters_confirmed_json, "outline_confirmed": item.outline_confirmed_json, "brief_revision": item.brief_revision, "characters_revision": item.characters_revision, "outline_revision": item.outline_revision} for item in db.scalars(select(WorkCreativeData)).all()],
+            "creative": [{"work_id": item.work_id, "brief": item.brief_json, "characters": item.characters_json, "outline": item.outline_json, "brief_confirmed": item.brief_confirmed_json, "characters_confirmed": item.characters_confirmed_json, "outline_confirmed": item.outline_confirmed_json, "brief_revision": item.brief_revision, "characters_revision": item.characters_revision, "outline_revision": item.outline_revision, "stage_status": item.stage_status_json or {}, "confirmation_source": item.confirmation_source_json or {}, "confirmation_event_ids": item.confirmation_event_ids_json or {}, "confirmation_dependencies": item.confirmation_dependencies_json or {}, "confirmation_history_complete": item.confirmation_history_complete, "proposal_history_complete": item.proposal_history_complete} for item in db.scalars(select(WorkCreativeData)).all()],
+            "creative_confirmation_events": _backup_rows(db, CreativeConfirmationEvent, ["id", "work_id", "stage", "event_type", "content_json", "source", "actor_user_id", "confirmed_at", "recorded_at", "dependencies_json", "reason", "trigger_event_id"]),
+            "change_proposals": _backup_rows(db, ChangeProposal, ["id", "work_id", "stage", "content_json", "base_revision", "status", "submitted_by_user_id", "reviewed_by_user_id", "rejection_reason", "stale_reason", "dependencies_json", "created_at", "reviewed_at"]),
             "providers": [{"id": item.id, "slug": item.slug, "name": item.name, "adapter": item.adapter, "enabled": item.enabled, "retention": item.retention_description, "deletion": item.deletion_description, "incident": item.incident_description} for item in db.scalars(select(ModelProvider)).all()],
             "model_configurations": [{"id": item.id, "enabled": item.enabled} for item in db.scalars(select(ModelConfiguration)).all()],
             "model_configs": [{"id": item.id, "model_id": item.model_id, "provider_id": item.provider_id, "version": item.version, "display_name": item.display_name, "adapter": item.adapter, "model_name": item.model_name, "endpoint": item.endpoint, "parameters": item.parameters_json, "status": item.status} for item in db.scalars(select(ModelConfigVersion)).all()],
@@ -1018,15 +1061,43 @@ def register_feature_routes(
                 data = WorkCreativeData(work_id=item["work_id"])
                 db.add(data)
             if data is not None:
+                has_r4_fields = all(key in item for key in ("stage_status", "confirmation_source", "confirmation_event_ids", "confirmation_dependencies")) and "creative_confirmation_events" in snapshot
+                has_existing_provenance = bool(data.confirmation_source_json or data.confirmation_event_ids_json)
                 data.brief_json = item.get("brief")
                 data.characters_json = item.get("characters")
                 data.outline_json = item.get("outline")
-                data.brief_confirmed_json = item.get("brief_confirmed")
-                data.characters_confirmed_json = item.get("characters_confirmed")
-                data.outline_confirmed_json = item.get("outline_confirmed")
+                if has_r4_fields or not has_existing_provenance:
+                    data.brief_confirmed_json = item.get("brief_confirmed")
+                    data.characters_confirmed_json = item.get("characters_confirmed")
+                    data.outline_confirmed_json = item.get("outline_confirmed")
                 data.brief_revision = item.get("brief_revision", data.brief_revision)
                 data.characters_revision = item.get("characters_revision", data.characters_revision)
                 data.outline_revision = item.get("outline_revision", data.outline_revision)
+                if has_r4_fields:
+                    data.stage_status_json = item.get("stage_status") or {}
+                    data.confirmation_source_json = item.get("confirmation_source") or {}
+                    data.confirmation_event_ids_json = item.get("confirmation_event_ids") or {}
+                    data.confirmation_dependencies_json = item.get("confirmation_dependencies") or {}
+                    data.confirmation_history_complete = item.get("confirmation_history_complete", True)
+                    data.proposal_history_complete = item.get("proposal_history_complete", "change_proposals" in snapshot)
+                elif not has_existing_provenance:
+                    record_legacy_baselines(db, data.work_id, data)
+                elif "change_proposals" not in snapshot:
+                    data.proposal_history_complete = False
+                if "creative_confirmation_events" not in snapshot:
+                    data.confirmation_history_complete = False
+        db.flush()
+        restored_work_set = set(restored_work_ids)
+        if "creative_confirmation_events" in snapshot:
+            db.execute(delete(CreativeConfirmationEvent).where(CreativeConfirmationEvent.work_id.in_(restored_work_set)))
+            for item in snapshot.get("creative_confirmation_events", []):
+                if item.get("work_id") in restored_work_set:
+                    db.add(CreativeConfirmationEvent(**_restore_values(item)))
+        if "change_proposals" in snapshot:
+            db.execute(delete(ChangeProposal).where(ChangeProposal.work_id.in_(restored_work_set)))
+            for item in snapshot.get("change_proposals", []):
+                if item.get("work_id") in restored_work_set and db.get(User, item.get("submitted_by_user_id")) is not None:
+                    db.add(ChangeProposal(**_restore_values(item)))
         db.flush()
         for item in snapshot.get("providers", []):
             provider = db.get(ModelProvider, item.get("id"))
