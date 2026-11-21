@@ -324,6 +324,10 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
     await expect(
       r4EditorPage.getByRole("heading", { name: "已过时的提案 · 原内容已保留" }),
     ).toBeVisible();
+    await expect(
+      r4EditorPage.getByRole("heading", { name: "已过时的待批提案", exact: true }),
+    ).toBeVisible();
+    await expect(r4EditorPage.getByText(/原因：上游设定已变化 · 记录时间：/)).toBeVisible();
     await expect(r4EditorPage.getByText("待重新确认").first()).toBeVisible();
     await r4EditorPage
       .getByRole("button", { name: "采用为草稿或新提案" })

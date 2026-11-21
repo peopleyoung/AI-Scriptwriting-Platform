@@ -172,16 +172,11 @@ def upgrade():
 
 
 def downgrade():
-    op.drop_index("ix_creative_confirmation_events_work_stage", table_name="creative_confirmation_events")
-    op.drop_index("ix_creative_confirmation_events_work_id", table_name="creative_confirmation_events")
-    op.drop_table("creative_confirmation_events")
-    with op.batch_alter_table("change_proposals") as batch:
-        batch.drop_column("dependencies_json")
-        batch.drop_column("stale_reason")
-    with op.batch_alter_table("work_creative_data") as batch:
-        batch.drop_column("proposal_history_complete")
-        batch.drop_column("confirmation_history_complete")
-        batch.drop_column("confirmation_dependencies_json")
-        batch.drop_column("confirmation_event_ids_json")
-        batch.drop_column("confirmation_source_json")
-        batch.drop_column("stage_status_json")
+    # R4 can move the only copy of a confirmed body into the event history.
+    # Downgrading by dropping the event table would silently destroy it. This
+    # revision is forward-only; use a verified pre-upgrade backup to roll back
+    # the application and database together, or ship a corrective migration.
+    raise RuntimeError(
+        "Migration 0010 is forward-only: restore a verified pre-upgrade backup "
+        "or apply a forward corrective migration; confirmation history cannot be dropped."
+    )

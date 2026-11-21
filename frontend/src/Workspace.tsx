@@ -1324,7 +1324,7 @@ export default function Workspace({
             stage={stage}
           />
           {(work.creative.history || [])
-            .filter((item) => item.stage === stage)
+            .filter((item) => item.stage === stage && item.event_type !== "PROPOSAL_STALE")
             .map((item) => (
               <article className="proposal" key={item.id}>
                 <h3>
@@ -1347,6 +1347,26 @@ export default function Workspace({
                 />
               </article>
             ))}
+          {(work.creative.history || [])
+            .filter((item) => item.stage === stage && item.event_type === "PROPOSAL_STALE")
+            .map((item) => {
+              const staleReasonLabels: Record<string, string> = {
+                UPSTREAM_CONFIRMATION_CHANGED: "上游设定已变化",
+                BASE_UNVERIFIED: "提案依据版本无法核验",
+                LEGACY_DEPENDENCY_UNVERIFIED: "旧版确认依赖关系无法核验",
+              };
+              const reason = item.reason || item.source;
+              return (
+                <article className="proposal" key={item.id}>
+                  <h3>已过时的待批提案</h3>
+                  <p className="hint">
+                    原提案正文保留在下方的过时提案卡片中，未作为确认记录。原因：
+                    {staleReasonLabels[reason] || reason} · 记录时间：
+                    {item.recorded_at ? formatDate(item.recorded_at) : "未知"}
+                  </p>
+                </article>
+              );
+            })}
           {work.proposals
             .filter((p) => p.stage === stage && p.status === "PENDING")
             .map((p) => (

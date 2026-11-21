@@ -433,6 +433,7 @@ export class Studio {
             content: clone(proposal.content),
             source: "UPSTREAM_CONFIRMATION_CHANGED",
             confirmed_at: null,
+            recorded_at: now(),
             reason: "UPSTREAM_CONFIRMATION_CHANGED",
             dependencies: {},
           });
@@ -504,6 +505,7 @@ export class Studio {
               content: clone(candidate.content),
               source: "UPSTREAM_CONFIRMATION_CHANGED",
               confirmed_at: null,
+              recorded_at: now(),
               reason: "UPSTREAM_CONFIRMATION_CHANGED",
               dependencies: {},
             });

@@ -1,5 +1,6 @@
 """Run real legacy upgrades on disposable SQLite/PostgreSQL databases."""
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -10,9 +11,13 @@ import pytest
 import sqlalchemy as sa
 
 from app.config import Settings
+from app.creative_rules import confirmation_chain_error
 from app.crypto import decrypt_secret, encrypt_secret
 from app.main import create_app
 from app.security import hash_password
+from app.db import build_engine, build_session_factory
+from app.lifecycle import recover_generation_state
+from app.models import CreativeConfirmationEvent, GenerationJob, Work, WorkCreativeData
 from test_versions_generation_export import CsrfClient, _login
 
 
@@ -168,4 +173,168 @@ def test_r4_migration_preserves_legacy_baselines_and_classifies_proposals(migrat
         assert sum(row[0] == "PROPOSAL_STALE" for row in events) == 2
         assert all(row[4] is None and row[5] is None for row in events)
         assert all(row[3] == "DEPENDENCY_UNVERIFIED" for row in events if row[0] == "LEGACY_BASELINE")
+    engine.dispose()
+
+
+def test_r4_migration_recovers_queued_job_with_complete_legacy_chain(migration_url):
+    env = {**os.environ, 'APP_DATABASE_URL': migration_url}
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run(
+        [sys.executable, '-m', 'alembic', 'upgrade', '0009_generation_retry_lineage'],
+        cwd=root, env=env, check=True, capture_output=True,
+    )
+    engine = sa.create_engine(migration_url)
+    metadata = sa.MetaData()
+    metadata.reflect(engine)
+    snapshot = {
+        'messages': [
+            {'role': 'system', 'content': 'legacy system prompt'},
+            {'role': 'user', 'content': 'legacy queued request'},
+        ],
+        'summary': {'source': 'pre-r4'},
+    }
+    snapshot_hash = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
+    with engine.begin() as db:
+        db.execute(metadata.tables['users'].insert().values(
+            id='l28-owner', username='l28-owner', password_hash='unused',
+            role='ADMIN', is_active=True, must_change_password=False,
+        ))
+        db.execute(metadata.tables['works'].insert().values(
+            id='l28-work', title='L28 legacy work', owner_id='l28-owner',
+            status='ACTIVE', revision=7, settings_json={}, draft_json={},
+        ))
+        db.execute(metadata.tables['work_members'].insert().values(
+            id='l28-member', work_id='l28-work', user_id='l28-owner',
+            role='OWNER', status='ACCEPTED',
+        ))
+        db.execute(metadata.tables['work_creative_data'].insert().values(
+            id='l28-creative', work_id='l28-work',
+            brief_json={'theme': 'legacy brief'},
+            characters_json=[{'name': 'legacy character'}],
+            outline_json={'premise': 'legacy outline'},
+            brief_confirmed_json={'theme': 'legacy brief'},
+            characters_confirmed_json=[{'name': 'legacy character'}],
+            outline_confirmed_json={'premise': 'legacy outline'},
+            brief_revision=2, characters_revision=3, outline_revision=4,
+        ))
+        db.execute(metadata.tables['model_providers'].insert().values(
+            id='l28-provider', slug='l28-provider', name='L28 provider',
+            adapter='mock', enabled=True,
+        ))
+        db.execute(metadata.tables['model_configurations'].insert().values(
+            id='l28-model', enabled=True,
+        ))
+        db.execute(metadata.tables['model_config_versions'].insert().values(
+            id='l28-config', model_id='l28-model', provider_id='l28-provider',
+            version=1, display_name='L28 mock', adapter='mock', model_name='mock',
+            parameters_json={}, status='ACTIVE',
+        ))
+        db.execute(metadata.tables['generation_jobs'].insert().values(
+            id='l28-queued-job', work_id='l28-work', requested_by_user_id='l28-owner',
+            idempotency_key='l28-original-key', input_revision=7,
+            target_type='WORK', target_path_json={}, instruction='legacy queued request',
+            model_config_version_id='l28-config', input_snapshot_json=snapshot,
+            status='QUEUED', retry_count=0,
+        ))
+        db.execute(metadata.tables['work_ai_activities'].insert().values(
+            work_id='l28-work', kind='GENERATION', reference_id='l28-queued-job',
+            user_id='l28-owner',
+        ))
+    engine.dispose()
+
+    subprocess.run(
+        [sys.executable, '-m', 'alembic', 'upgrade', 'head'],
+        cwd=root, env=env, check=True, capture_output=True,
+    )
+    engine = build_engine(migration_url)
+    factory = build_session_factory(engine)
+    with factory() as db:
+        work = db.get(Work, 'l28-work')
+        creative = db.query(WorkCreativeData).filter_by(work_id='l28-work').one()
+        job = db.get(GenerationJob, 'l28-queued-job')
+        assert work.revision == 7
+        assert creative.stage_status_json == {
+            'brief': 'CONFIRMED', 'characters': 'CONFIRMED', 'outline': 'CONFIRMED',
+        }
+        assert confirmation_chain_error(creative) is None
+        assert db.query(CreativeConfirmationEvent).filter_by(
+            work_id='l28-work', event_type='LEGACY_BASELINE',
+        ).count() == 3
+        assert job.status == 'QUEUED'
+        assert job.input_revision == 7
+        assert job.idempotency_key == 'l28-original-key'
+        assert hashlib.sha256(json.dumps(job.input_snapshot_json, sort_keys=True).encode()).hexdigest() == snapshot_hash
+
+    assert recover_generation_state(factory) == ['l28-queued-job']
+    with factory() as db:
+        work = db.get(Work, 'l28-work')
+        job = db.get(GenerationJob, 'l28-queued-job')
+        assert work.revision == 7
+        assert job.status == 'QUEUED'
+        assert job.input_revision == 7
+        assert job.idempotency_key == 'l28-original-key'
+        assert hashlib.sha256(json.dumps(job.input_snapshot_json, sort_keys=True).encode()).hexdigest() == snapshot_hash
+    engine.dispose()
+
+
+def test_r4_downgrade_refuses_to_drop_confirmation_history(migration_url):
+    env = {**os.environ, 'APP_DATABASE_URL': migration_url}
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run(
+        [sys.executable, '-m', 'alembic', 'upgrade', '0009_generation_retry_lineage'],
+        cwd=root, env=env, check=True, capture_output=True,
+    )
+    engine = sa.create_engine(migration_url)
+    metadata = sa.MetaData()
+    metadata.reflect(engine)
+    confirmed_content = {'theme': 'only copy preserved in event history'}
+    with engine.begin() as db:
+        db.execute(metadata.tables['users'].insert().values(
+            id='downgrade-owner', username='downgrade-owner', password_hash='unused',
+            role='ADMIN', is_active=True, must_change_password=False,
+        ))
+        db.execute(metadata.tables['works'].insert().values(
+            id='downgrade-work', title='downgrade protection', owner_id='downgrade-owner',
+            status='ACTIVE', revision=1, settings_json={}, draft_json={},
+        ))
+        db.execute(metadata.tables['work_members'].insert().values(
+            id='downgrade-member', work_id='downgrade-work', user_id='downgrade-owner',
+            role='OWNER', status='ACCEPTED',
+        ))
+        db.execute(metadata.tables['work_creative_data'].insert().values(
+            id='downgrade-creative', work_id='downgrade-work',
+            brief_json={'draft': 'different'}, characters_json=None, outline_json=None,
+            brief_confirmed_json=confirmed_content, characters_confirmed_json=None,
+            outline_confirmed_json=None, brief_revision=1, characters_revision=0,
+            outline_revision=0,
+        ))
+    engine.dispose()
+
+    subprocess.run(
+        [sys.executable, '-m', 'alembic', 'upgrade', 'head'],
+        cwd=root, env=env, check=True, capture_output=True,
+    )
+    downgrade = subprocess.run(
+        [sys.executable, '-m', 'alembic', 'downgrade', '0009_generation_retry_lineage'],
+        cwd=root, env=env, capture_output=True, text=True,
+    )
+    assert downgrade.returncode != 0
+    assert 'forward-only' in downgrade.stderr
+
+    # The failed rollback leaves the database at 0010 and can proceed forward.
+    subprocess.run(
+        [sys.executable, '-m', 'alembic', 'upgrade', 'head'],
+        cwd=root, env=env, check=True, capture_output=True,
+    )
+    engine = sa.create_engine(migration_url)
+    with engine.connect() as db:
+        version = db.execute(sa.text('SELECT version_num FROM alembic_version')).scalar_one()
+        history = db.execute(sa.text(
+            "SELECT content_json FROM creative_confirmation_events "
+            "WHERE work_id='downgrade-work' AND stage='brief' AND event_type='LEGACY_BASELINE'"
+        )).scalar_one()
+        assert version == '0010_creative_confirmation_history'
+        assert history == confirmed_content
+        assert sa.inspect(engine).has_table('creative_confirmation_events')
+        assert 'stage_status_json' in {column['name'] for column in sa.inspect(engine).get_columns('work_creative_data')}
     engine.dispose()
