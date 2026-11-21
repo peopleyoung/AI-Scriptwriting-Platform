@@ -5,3 +5,5 @@
 每次有明确业务意义的正文保存、生成成功或恢复操作，都会产生覆盖整部作品的不可变版本；生成集、场景或片段时，只替换目标范围并带入其他内容。自动保存只更新工作草稿，不产生版本。发布是绑定某个版本的独立不可变记录，一部作品可以保留多个发布记录，导出只接受发布记录。这样既保留模型讨论的灵活性，也避免协作者或模型无意中改变故事基础，并让长篇创作可以回退。
 
 2026-10-13 补充：所有者与编辑者均可显式保存版本；恢复、发布及导出仍由所有者执行。上游变更后的下游重新确认见 [ADR-0008](0008-downstream-reconfirmation-after-setting-change.md)，正文生成期间的输入与外部对话锁定见 [ADR-0009](0009-work-input-lock-during-generation.md)。
+
+2026-11-21 当前实现校正：上文 2026-10-13 的“所有者与编辑者均可显式保存版本”已由 CALL-6 FEAT-01 落地。`POST /api/v1/works/{work_id}/versions` 对 OWNER 与 EDITOR 开放（`app/features.py::create_version`）；版本恢复、正式稿发布和创建导出仍仅限 OWNER（`restore_version`、`publish_version`、`create_export`），导出下载由 active 作品成员凭未过期 token 完成（`download_export`）。

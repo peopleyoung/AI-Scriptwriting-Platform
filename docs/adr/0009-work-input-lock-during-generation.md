@@ -26,3 +26,4 @@
 
 前端据此把 `WORKER_INTERRUPTED` 文案化为「服务重启导致任务中断，原正文已保留」，并让重试轮询新任务 id 而非失败任务的旧 id。
 
+2026-11-21 当前实现说明：本 ADR 中的锁与冲突约束仍有效。人工显式保存版本对 OWNER 与 EDITOR 开放，恢复与发布正式稿仍仅 OWNER 可执行（`app/features.py::create_version`、`restore_version`、`publish_version`）。原文关于“外发确认失效”的历史规则已由 [ADR-0011](0011-direct-model-configuration-and-member-invocation.md) 替代，当前创作对话和正文生成由具备作品编辑权限的成员直接发起。
