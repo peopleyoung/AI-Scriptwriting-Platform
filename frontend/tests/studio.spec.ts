@@ -391,6 +391,14 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
     page.getByRole("dialog", { name: "确认本次创作的发送范围" }),
   ).toHaveCount(0);
   await expect(page.locator(".chat-assistant").last()).toContainText("第二段完成");
+  // Text chunks precede the terminal SSE event and release of work occupancy.
+  // Identify the new turn first; the previous assistant reply has the same text.
+  await expect(page.locator(".chat-user").last()).toContainText("第二轮讨论");
+  await expect(page.locator(".chat-assistant").last().getByRole("status")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "停止回复", exact: true })).toHaveCount(0);
+  await expect(
+    page.getByText("作品已有成员正在进行创作对话，当前输入已保留。", { exact: true }),
+  ).toHaveCount(0);
   await expect(block).toHaveValue("草稿新修改");
   await page.getByRole("button", { name: "版本", exact: true }).click();
   await page.getByRole("button", { name: "恢复此版本" }).click();

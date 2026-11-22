@@ -334,6 +334,8 @@ def test_r4_downgrade_refuses_to_drop_confirmation_history(migration_url):
             "WHERE work_id='downgrade-work' AND stage='brief' AND event_type='LEGACY_BASELINE'"
         )).scalar_one()
         assert version == '0010_creative_confirmation_history'
+        if isinstance(history, str):
+            history = json.loads(history)
         assert history == confirmed_content
         assert sa.inspect(engine).has_table('creative_confirmation_events')
         assert 'stage_status_json' in {column['name'] for column in sa.inspect(engine).get_columns('work_creative_data')}
