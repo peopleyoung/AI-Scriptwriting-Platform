@@ -227,16 +227,21 @@ test("FEAT-04 重试任务新建 job 并轮询新 id，原失败任务保留血�
   });
 
   await page.getByRole("button", { name: "生成任务" }).click();
+  const retryFinished = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname ===
+        `/api/v1/works/${work.id}/generation-jobs/${first.id}/retry`,
+    { timeout: 15000 },
+  );
   await page.getByRole("button", { name: "重试任务" }).click();
-
-  await expect
-    .poll(() => polled.filter((entry) => entry.startsWith("POST")).length, {
-      timeout: 15000,
-    })
-    .toBeGreaterThan(0);
-
+  // Request issuance does not mean the retry transaction has committed.
+  const retryResponse = await retryFinished;
+  expect(retryResponse.status(), await retryResponse.text()).toBe(201);
+  const created = await retryResponse.json();
+  expect(created.id).not.toBe(first.id);
   const jobs = await api(request, `/works/${work.id}/generation-jobs`);
-  const retried = jobs.find((j: { id: string }) => j.id !== first.id);
+  const retried = jobs.find((j: { id: string }) => j.id === created.id);
   expect(retried, `expected a second job, saw ${JSON.stringify(jobs)}`).toBeTruthy();
   // The UI must poll the NEW job id, not the original failed one.
   await expect
