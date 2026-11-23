@@ -154,6 +154,12 @@ class WorkCreativeData(Base):
     brief_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     characters_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     outline_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    stage_status_json: Mapped[dict[str, str]] = mapped_column(JSON, default=lambda: {"brief": "DRAFT", "characters": "DRAFT", "outline": "DRAFT"}, server_default=text("'{}'"), nullable=False)
+    confirmation_source_json: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, server_default=text("'{}'"), nullable=False)
+    confirmation_event_ids_json: Mapped[dict[str, str | None]] = mapped_column(JSON, default=dict, server_default=text("'{}'"), nullable=False)
+    confirmation_dependencies_json: Mapped[dict[str, dict[str, str]]] = mapped_column(JSON, default=dict, server_default=text("'{}'"), nullable=False)
+    confirmation_history_complete: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"), nullable=False)
+    proposal_history_complete: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -186,12 +192,35 @@ class ChangeProposal(Base):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     rejection_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    stale_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    dependencies_json: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, server_default=text("'{}'"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     work: Mapped["Work"] = relationship(back_populates="change_proposals")
     submitted_by: Mapped["User"] = relationship(foreign_keys=[submitted_by_user_id])
     reviewed_by: Mapped["User | None"] = relationship(foreign_keys=[reviewed_by_user_id])
+
+
+class CreativeConfirmationEvent(Base):
+    __tablename__ = "creative_confirmation_events"
+    __table_args__ = (Index("ix_creative_confirmation_events_work_stage", "work_id", "stage", "recorded_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    work_id: Mapped[str] = mapped_column(ForeignKey("works.id", ondelete="CASCADE"), nullable=False, index=True)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_json: Mapped[Any] = mapped_column(JSON, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    dependencies_json: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, server_default=text("'{}'"), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    trigger_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    work: Mapped["Work"] = relationship()
+    actor: Mapped["User | None"] = relationship(foreign_keys=[actor_user_id])
 
 
 

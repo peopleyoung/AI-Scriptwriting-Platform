@@ -2,6 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 const production = process.env.PLAYWRIGHT_PRODUCTION === "1";
 const baseURL = production ? "http://127.0.0.1:8015" : "http://127.0.0.1:5185";
+const backendPython = process.env.PLAYWRIGHT_BACKEND_PYTHON || "../.venv/bin/python";
 
 export default defineConfig({
   testDir: "./tests",
@@ -17,7 +18,7 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: "../.venv/bin/python tests/serve_backend.py",
+      command: `"${backendPython}" tests/serve_backend.py`,
       url: "http://127.0.0.1:8015/healthz",
       reuseExistingServer: false,
     },

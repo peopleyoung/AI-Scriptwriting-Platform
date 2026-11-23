@@ -228,6 +228,27 @@ def test_recovery_interrupts_running_and_keeps_or_validates_queued(tmp_path: Pat
             db.get(Work, stale_work).status = "TRASHED"
             db.commit()
 
+        changed_work, _, changed_job = _queued_job(client, upstream)
+        with factory() as db:
+            db.query(WorkAIActivity).filter(WorkAIActivity.work_id == changed_work).delete()
+            db.commit()
+        proposal = client.post(
+            f"/api/v1/works/{changed_work}/change-proposals",
+            json={"stage": "brief", "content": {"theme": "上游发生变化"}},
+        )
+        assert proposal.status_code == 201, proposal.text
+        approved = client.post(
+            f"/api/v1/works/{changed_work}/change-proposals/{proposal.json()['id']}/approve"
+        )
+        assert approved.status_code == 200, approved.text
+        manual_run = client.post(
+            f"/api/v1/works/{changed_work}/generation-jobs/{changed_job}/run"
+        )
+        assert manual_run.status_code == 200
+        assert manual_run.json()["status"] == "FAILED"
+        assert manual_run.json()["error_code"] == "SETTINGS_NOT_CONFIRMED"
+        assert upstream.requests == []
+
         enqueued = set(lifecycle.recover_generation_state(factory))
 
         with factory() as db:
@@ -238,9 +259,14 @@ def test_recovery_interrupts_running_and_keeps_or_validates_queued(tmp_path: Pat
 
             s = db.get(GenerationJob, stale_job)
             assert s.status == "FAILED" and s.error_code == "WORK_INACTIVE"
+            changed = db.get(GenerationJob, changed_job)
+            assert changed.status == "FAILED" and changed.error_code == "SETTINGS_NOT_CONFIRMED"
 
         assert healthy_job in enqueued
-        assert running_job not in enqueued and stale_job not in enqueued
+        assert running_job not in enqueued and stale_job not in enqueued and changed_job not in enqueued
+        retry = client.post(f"/api/v1/works/{changed_work}/generation-jobs/{changed_job}/retry")
+        assert retry.status_code == 409
+        assert _detail_code(retry) == "SETTINGS_NOT_CONFIRMED"
 
 
 def test_retry_creates_new_job_with_lineage(tmp_path: Path):

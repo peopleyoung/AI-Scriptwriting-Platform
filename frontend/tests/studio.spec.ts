@@ -146,8 +146,13 @@ test("未保存保护、刷新恢复、设定变更审批、深色与手机", as
   await expect(
     page.getByRole("heading", { name: "待审批的变更提案" }),
   ).toHaveCount(0);
+  const currentBrief = page
+    .getByRole("dialog", { name: "故事设定" })
+    .locator(".creative-field")
+    .filter({ hasText: "核心主题" })
+    .first();
   await expect(
-    page.getByText("关于失去和找回的故事", { exact: true }),
+    currentBrief.getByText("关于失去和找回的故事", { exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "回到写作", exact: true }).click();
   await page.getByRole("button", { name: "切换深色主题" }).click();
@@ -187,6 +192,7 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
   request,
   browser,
 }) => {
+  test.setTimeout(240_000);
   // Tolerant bootstrap (matches zz-model-chat.spec.ts and the recovery case
   // below): specs share one disposable database, so the admin may already
   // exist when another spec provisioned it first.
@@ -210,7 +216,7 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
       username,
       password: "Browser-password-123",
     });
-  await api(request, "/admin/model-configs", "POST", {
+  const browserModel = await api(request, "/admin/model-configs", "POST", {
     display_name: "浏览器测试模型", model_name: "normal-browser", base_url: "http://127.0.0.1:8016/v1", api_key: "browser-test-key",
   });
   await login(page, "browserowner", true);
@@ -242,6 +248,136 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
       page.getByRole("button", { name: "提出设定变更" }),
     ).toBeVisible();
   }
+  const r4Editor = `r4editor${Date.now()}`;
+  await api(request, "/admin/users", "POST", {
+    username: r4Editor,
+    password: "Browser-password-123",
+  });
+  await api(page.request, `/works/${workId}/members/invitations`, "POST", {
+    username: r4Editor,
+    role: "EDITOR",
+  });
+  const r4EditorContext = await browser.newContext();
+  const r4EditorPage = await r4EditorContext.newPage();
+  await login(r4EditorPage, r4Editor, true);
+  await r4EditorPage
+    .getByRole("button", { name: "团队协作", exact: true })
+    .click();
+  await r4EditorPage.getByRole("button", { name: "接受邀请" }).click();
+  await r4EditorPage
+    .getByRole("button", { name: "打开真实接口的故事", exact: true })
+    .click();
+  await r4EditorPage.getByRole("button", { name: "查看设定", exact: true }).click();
+  await r4EditorPage
+    .locator(".modal-tabs")
+    .getByRole("button", { name: "人物设定" })
+    .click();
+  await r4EditorPage
+    .getByRole("button", { name: "提出设定变更", exact: true })
+    .click();
+  await r4EditorPage.getByRole("textbox").first().fill("林知夏");
+  await r4EditorPage.getByRole("button", { name: "提交变更提案" }).click();
+  await r4EditorPage
+    .locator(".modal-tabs")
+    .getByRole("button", { name: "故事大纲" })
+    .click();
+  await r4EditorPage
+    .getByRole("button", { name: "提出设定变更", exact: true })
+    .click();
+  await r4EditorPage.getByRole("textbox").first().fill("迟到的调查线索");
+  await r4EditorPage.getByRole("button", { name: "提交变更提案" }).click();
+  const changedCharacters = (await api(
+    r4EditorPage.request,
+    `/works/${workId}/change-proposals`,
+  )).find((proposal: { stage: string }) => proposal.stage === "characters");
+  await r4EditorPage.getByRole("button", { name: "回到写作", exact: true }).click();
+
+  await page.reload();
+  await page.getByRole("button", { name: "查看设定", exact: true }).click();
+  await page.locator(".modal-tabs").getByRole("button", { name: "创作简报" }).click();
+  await page.getByRole("button", { name: "提出设定变更", exact: true }).click();
+  await page.getByRole("textbox").first().fill("新的调查主题");
+  await page.getByRole("button", { name: "提交变更提案" }).click();
+  // A click completes before the approval transaction; generation must observe
+  // the committed downstream invalidation rather than the old confirmed chain.
+  const approval = page.waitForResponse((response) =>
+    response.request().method() === "POST" &&
+    response.url().includes(`/works/${workId}/change-proposals/`) &&
+    response.url().endsWith("/approve"),
+  );
+  await page.getByRole("button", { name: "接受变更", exact: true }).click();
+  expect((await approval).ok()).toBeTruthy();
+  expect((await api(page.request, `/works/${workId}/creative`)).states).toEqual({
+    brief: "CONFIRMED",
+    characters: "NEEDS_RECONFIRMATION",
+    outline: "NEEDS_RECONFIRMATION",
+  });
+  const ownerCookies = (await page.request.storageState()).cookies;
+  const ownerCsrf = ownerCookies.find((cookie) => cookie.name === "scriptwriting_csrf");
+  const blockedGeneration = await page.request.fetch(
+    `/api/v1/works/${workId}/generation-jobs`,
+    {
+      method: "POST",
+      data: {
+        // Use a valid model so the request reaches the confirmation-chain guard.
+        model_config_version_id: browserModel.id,
+        target_type: "WORK",
+        target_path: {},
+        idempotency_key: `r4-blocked-${Date.now()}`,
+      },
+      headers: ownerCsrf ? { "X-CSRF-Token": ownerCsrf.value } : {},
+    },
+  );
+  expect(blockedGeneration.status()).toBe(409);
+  expect((await blockedGeneration.json()).detail.code).toBe("SETTINGS_NOT_CONFIRMED");
+  await page.getByRole("button", { name: "回到写作", exact: true }).click();
+
+  await r4EditorPage.reload();
+  await r4EditorPage.getByRole("button", { name: "查看设定", exact: true }).click();
+  r4EditorPage.on("dialog", (dialog) => dialog.accept());
+  for (const [stage, value] of [
+    ["人物设定", "林知夏"],
+    ["故事大纲", "迟到的调查线索"],
+  ]) {
+    await r4EditorPage.locator(".modal-tabs").getByRole("button", { name: stage }).click();
+    await expect(
+      r4EditorPage.getByRole("heading", { name: "已过时的提案 · 原内容已保留" }),
+    ).toBeVisible();
+    await expect(
+      r4EditorPage.getByRole("heading", { name: "已过时的待批提案", exact: true }),
+    ).toBeVisible();
+    await expect(r4EditorPage.getByText(/原因：上游设定已变化 · 记录时间：/)).toBeVisible();
+    await expect(r4EditorPage.getByText("待重新确认").first()).toBeVisible();
+    await r4EditorPage
+      .getByRole("button", { name: "采用为草稿或新提案" })
+      .click();
+    await r4EditorPage.getByRole("button", { name: "编辑设定", exact: true }).click();
+    await r4EditorPage.getByRole("textbox").first().fill(value);
+    await r4EditorPage.getByRole("button", { name: "保存设定草稿" }).click();
+  }
+  await r4EditorPage.getByRole("button", { name: "回到写作", exact: true }).click();
+
+  await page.reload();
+  await page.getByRole("button", { name: "查看设定", exact: true }).click();
+  for (const stage of ["人物设定", "故事大纲"]) {
+    await page.locator(".modal-tabs").getByRole("button", { name: stage }).click();
+    await expect(page.getByText("待重新确认").first()).toBeVisible();
+    await page.getByRole("button", { name: "确认此阶段", exact: true }).click();
+  }
+  const reconciledCreative = await api(page.request, `/works/${workId}/creative`);
+  expect(Object.values(reconciledCreative.states)).toEqual([
+    "CONFIRMED",
+    "CONFIRMED",
+    "CONFIRMED",
+  ]);
+  const retainedProposals = await api(page.request, `/works/${workId}/change-proposals`);
+  const retainedCharacterProposal = retainedProposals.find(
+    (proposal: { id: string }) => proposal.id === changedCharacters.id,
+  );
+  expect(retainedCharacterProposal.status).toBe("STALE");
+  expect(retainedCharacterProposal.content).toEqual(changedCharacters.content);
+  await r4EditorContext.close();
+
   await page.getByRole("button", { name: "回到写作", exact: true }).click();
   await page.getByRole("button", { name: "添加第一集" }).click();
   await page.getByLabel("本集标题").fill("第一封信");
@@ -273,7 +409,21 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
   await expect(
     page.getByRole("dialog", { name: "确认本次创作的发送范围" }),
   ).toHaveCount(0);
-  await expect(page.locator(".chat-assistant").last()).toContainText("第二段完成");
+  // Both mock replies have the same text; require the reply for the new turn.
+  const secondReply = page
+    .locator(".conversation")
+    .filter({
+      has: page.locator(".chat-user").getByText("第二轮讨论", { exact: true }),
+    })
+    .locator(".chat-assistant");
+  await expect(secondReply).toContainText("第二段完成");
+  // Text chunks precede the terminal SSE event and release of work occupancy.
+  await expect(page.locator(".chat-user").last()).toContainText("第二轮讨论");
+  await expect(secondReply.getByRole("status")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "停止回复", exact: true })).toHaveCount(0);
+  await expect(
+    page.getByText("作品已有成员正在进行创作对话，当前输入已保留。", { exact: true }),
+  ).toHaveCount(0);
   await expect(block).toHaveValue("草稿新修改");
   await page.getByRole("button", { name: "版本", exact: true }).click();
   await page.getByRole("button", { name: "恢复此版本" }).click();

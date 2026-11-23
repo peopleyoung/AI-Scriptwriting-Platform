@@ -15,6 +15,7 @@ from app.db import Base, build_engine, build_session_factory, get_db
 from app.models import (
     AuditLog,
     ChangeProposal,
+    CreativeConfirmationEvent,
     ScriptTemplate,
     ScriptTemplateVersion,
     SessionRecord,
@@ -25,6 +26,18 @@ from app.models import (
 )
 from app.features import invalidate_work_external_state, register_feature_routes
 from app.creative_calls import cancel_calls, ensure_editable, finish_conversation, release
+from app.creative_rules import (
+    STAGES as _CREATIVE_STAGES,
+    UPSTREAM as _CREATIVE_UPSTREAM,
+    confirmation_chain_error,
+    invalidate_downstream,
+    proposal_dependencies,
+    proposal_dependencies_current,
+    record_confirmation,
+    stage_dependencies_current,
+    stage_status,
+    upstream_stages_confirmed,
+)
 from app.model_adapters import ModelAdapterError
 from app.schemas import (
     AuditResponse,
@@ -57,9 +70,6 @@ from app.security import hash_password, new_session_token, session_expiry, sessi
 
 
 _failed_logins: dict[tuple[str, str], list[datetime]] = {}
-
-_CREATIVE_STAGES = ("brief", "characters", "outline")
-
 
 def _builtin_template_definitions() -> list[dict[str, Any]]:
     common_settings = {
@@ -350,8 +360,13 @@ def _set_stage(data: WorkCreativeData, stage: str, content: Any, *, confirmed: b
         setattr(data, f"{stage}_confirmed_json", deepcopy(content))
 
 
-def _creative_response(work: Work) -> CreativeResponse:
+def _creative_response(work: Work, db: Session) -> CreativeResponse:
     data = _creative_data(work)
+    history = db.scalars(
+        select(CreativeConfirmationEvent)
+        .where(CreativeConfirmationEvent.work_id == work.id)
+        .order_by(CreativeConfirmationEvent.recorded_at, CreativeConfirmationEvent.id)
+    ).all()
     return CreativeResponse(
         work_id=work.id,
         brief=data.brief_json,
@@ -359,6 +374,23 @@ def _creative_response(work: Work) -> CreativeResponse:
         outline=data.outline_json,
         confirmed={stage: getattr(data, f"{stage}_confirmed_json") for stage in _CREATIVE_STAGES},
         revisions={stage: _stage_revision(data, stage) for stage in _CREATIVE_STAGES},
+        states={stage: stage_status(data, stage) for stage in _CREATIVE_STAGES},
+        sources=data.confirmation_source_json or {},
+        confirmation_history_complete=data.confirmation_history_complete,
+        proposal_history_complete=data.proposal_history_complete,
+        history=[{
+            "id": event.id,
+            "stage": event.stage,
+            "event_type": event.event_type,
+            "content": event.content_json,
+            "source": event.source,
+            "actor_user_id": event.actor_user_id,
+            "confirmed_at": event.confirmed_at,
+            "recorded_at": event.recorded_at,
+            "dependencies": event.dependencies_json or {},
+            "reason": event.reason,
+            "trigger_event_id": event.trigger_event_id,
+        } for event in history],
     )
 
 
@@ -373,6 +405,8 @@ def _proposal_response(proposal: ChangeProposal) -> ChangeProposalResponse:
         submitted_by_user_id=proposal.submitted_by_user_id,
         reviewed_by_user_id=proposal.reviewed_by_user_id,
         rejection_reason=proposal.rejection_reason,
+        stale_reason=proposal.stale_reason,
+        dependencies=proposal.dependencies_json or {},
         created_at=proposal.created_at,
         reviewed_at=proposal.reviewed_at,
     )
@@ -897,7 +931,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/works/{work_id}/creative", response_model=CreativeResponse)
     def get_creative(work_id: str, user: Annotated[User, Depends(active_user)], db: Annotated[Session, Depends(get_db)]) -> CreativeResponse:
         work, _ = _require_work_member(db, user, work_id)
-        return _creative_response(work)
+        return _creative_response(work, db)
 
     @app.get("/api/v1/works/{work_id}/creative/{stage}", response_model=dict[str, Any])
     @app.get("/api/v1/works/{work_id}/creative-{stage}", response_model=dict[str, Any], include_in_schema=False)
@@ -911,6 +945,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "draft": getattr(data, f"{stage}_json"),
             "confirmed": getattr(data, f"{stage}_confirmed_json"),
             "revision": _stage_revision(data, stage),
+            "state": stage_status(data, stage),
+            "source": (data.confirmation_source_json or {}).get(stage),
+            "confirmation_history_complete": data.confirmation_history_complete,
+            "proposal_history_complete": data.proposal_history_complete,
+            "history": [{
+                "id": event.id,
+                "event_type": event.event_type,
+                "content": event.content_json,
+                "source": event.source,
+                "confirmed_at": event.confirmed_at,
+                "recorded_at": event.recorded_at,
+                "reason": event.reason,
+            } for event in db.scalars(select(CreativeConfirmationEvent).where(CreativeConfirmationEvent.work_id == work.id, CreativeConfirmationEvent.stage == stage).order_by(CreativeConfirmationEvent.recorded_at, CreativeConfirmationEvent.id)).all()],
         }
 
     @app.patch("/api/v1/works/{work_id}/creative/{stage}", response_model=dict[str, Any])
@@ -953,6 +1000,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "draft": getattr(data, f"{stage}_json"),
             "confirmed": getattr(data, f"{stage}_confirmed_json"),
             "revision": _stage_revision(data, stage),
+            "state": stage_status(data, stage),
+            "source": (data.confirmation_source_json or {}).get(stage),
+            "confirmation_history_complete": data.confirmation_history_complete,
+            "proposal_history_complete": data.proposal_history_complete,
         }
 
     @app.post("/api/v1/works/{work_id}/creative/{stage}/confirm", response_model=dict[str, Any])
@@ -972,21 +1023,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if expected is not None and expected != work.revision:
             raise _error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
         data = _creative_data(work)
-        if getattr(data, f"{stage}_confirmed_json") is not None:
+        if stage_status(data, stage) == "CONFIRMED" and getattr(data, f"{stage}_confirmed_json") is not None:
             raise _error("STAGE_ALREADY_CONFIRMED", "the creative stage is already confirmed; submit a change proposal", status.HTTP_409_CONFLICT)
-        previous = {"brief": None, "characters": "brief", "outline": "characters"}[stage]
-        if previous and getattr(data, f"{previous}_confirmed_json") is None:
+        if not upstream_stages_confirmed(data, stage):
             raise _error("STAGE_ORDER_INVALID", "creative stages must be confirmed in order", status.HTTP_409_CONFLICT)
         draft = getattr(data, f"{stage}_json")
         if draft is None:
             raise _error("CREATIVE_DRAFT_REQUIRED", "save a draft before confirming the stage", status.HTTP_409_CONFLICT)
         draft = _validate_creative(work.template_version, stage, draft)
-        _set_stage(data, stage, draft, confirmed=True)
+        _set_stage(data, stage, draft)
+        event = record_confirmation(db, work, data, stage, draft, owner)
         setattr(data, f"{stage}_revision", _stage_revision(data, stage) + 1)
+        invalidated = invalidate_downstream(db, work, data, stage, event, owner)
         work.revision += 1
         invalidate_work_external_state(db, work.id)
         work.updated_at = datetime.now(timezone.utc)
-        _audit(db, "CREATIVE_STAGE_CONFIRMED", actor=owner, metadata={"work_id": work.id, "stage": stage})
+        _audit(db, "CREATIVE_STAGE_CONFIRMED", actor=owner, metadata={"work_id": work.id, "stage": stage, "confirmation_event_id": event.id, "invalidated_stages": invalidated})
+        for downstream in invalidated:
+            _audit(db, "CREATIVE_STAGE_RECONFIRMATION_REQUIRED", metadata={"work_id": work.id, "stage": downstream, "trigger_event_id": event.id})
         db.commit()
         return {
             "work_id": work.id,
@@ -994,6 +1048,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "draft": getattr(data, f"{stage}_json"),
             "confirmed": getattr(data, f"{stage}_confirmed_json"),
             "revision": _stage_revision(data, stage),
+            "state": stage_status(data, stage),
+            "source": (data.confirmation_source_json or {}).get(stage),
         }
 
     @app.post("/api/v1/works/{work_id}/change-proposals", response_model=ChangeProposalResponse, status_code=status.HTTP_201_CREATED)
@@ -1010,7 +1066,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         work, _ = _require_work_member(db, user, work_id, {"OWNER", "EDITOR"})
         _ensure_work_editable(db, work.id)
         data = _creative_data(work)
-        if getattr(data, f"{stage}_confirmed_json") is None:
+        if stage_status(data, stage) != "CONFIRMED" or getattr(data, f"{stage}_confirmed_json") is None or not stage_dependencies_current(data, stage):
             raise _error("SETTING_NOT_CONFIRMED", "only confirmed settings can have change proposals", status.HTTP_409_CONFLICT)
         content = _validate_creative(work.template_version, stage, payload.content)
         existing = db.scalar(
@@ -1029,6 +1085,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             base_revision=_stage_revision(data, stage),
             status="PENDING",
             submitted_by_user_id=user.id,
+            dependencies_json=proposal_dependencies(data, stage),
         )
         db.add(proposal)
         try:
@@ -1053,6 +1110,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ).all()
         return [_proposal_response(proposal) for proposal in proposals]
 
+    @app.post("/api/v1/works/{work_id}/change-proposals/{proposal_id}/adopt")
+    def adopt_stale_proposal(
+        work_id: str,
+        proposal_id: str,
+        payload: dict[str, Any],
+        request: Request,
+        user: Annotated[User, Depends(active_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> dict[str, Any]:
+        _check_csrf(request)
+        work, _ = _require_work_member(db, user, work_id, {"OWNER", "EDITOR"})
+        _ensure_work_editable(db, work.id)
+        proposal = db.scalar(select(ChangeProposal).where(ChangeProposal.id == proposal_id, ChangeProposal.work_id == work.id))
+        if proposal is None:
+            raise _error("PROPOSAL_NOT_FOUND", "change proposal not found", status.HTTP_404_NOT_FOUND)
+        if proposal.status != "STALE":
+            raise _error("PROPOSAL_NOT_STALE", "only stale proposal content can be adopted", status.HTTP_409_CONFLICT)
+        if payload.get("replace_existing") is not True:
+            raise _error("DRAFT_REPLACEMENT_CONFIRMATION_REQUIRED", "请先确认采用旧提案会替换当前设定草稿。", status.HTTP_409_CONFLICT)
+        expected = payload.get("expected_revision")
+        if expected is not None and expected != work.revision:
+            raise _error("REVISION_CONFLICT", "work revision has changed", status.HTTP_409_CONFLICT)
+        data = _creative_data(work)
+        content = _validate_creative(work.template_version, proposal.stage, proposal.content_json)
+        if stage_status(data, proposal.stage) == "CONFIRMED" and getattr(data, f"{proposal.stage}_confirmed_json") is not None:
+            if not stage_dependencies_current(data, proposal.stage):
+                raise _error("SETTING_NOT_CONFIRMED", "按顺序重新确认上游设定后才能基于当前设定提交提案。", status.HTTP_409_CONFLICT)
+            existing = db.scalar(select(ChangeProposal).where(ChangeProposal.work_id == work.id, ChangeProposal.stage == proposal.stage, ChangeProposal.status == "PENDING"))
+            if existing is not None:
+                raise _error("PROPOSAL_ALREADY_PENDING", "这项设定已有待审批提案，原内容保持不变。", status.HTTP_409_CONFLICT)
+            adopted = ChangeProposal(
+                work_id=work.id,
+                stage=proposal.stage,
+                content_json=deepcopy(content),
+                base_revision=_stage_revision(data, proposal.stage),
+                status="PENDING",
+                submitted_by_user_id=user.id,
+                dependencies_json=proposal_dependencies(data, proposal.stage),
+            )
+            db.add(adopted)
+            db.flush()
+            _audit(db, "STALE_PROPOSAL_ADOPTED_AS_NEW_PROPOSAL", actor=user, metadata={"work_id": work.id, "source_proposal_id": proposal.id, "proposal_id": adopted.id, "stage": proposal.stage})
+            db.commit()
+            return {"adopted_as": "PENDING_PROPOSAL", "proposal": _proposal_response(adopted).model_dump()}
+        setattr(data, f"{proposal.stage}_json", deepcopy(content))
+        setattr(data, f"{proposal.stage}_revision", _stage_revision(data, proposal.stage) + 1)
+        work.revision += 1
+        work.updated_at = datetime.now(timezone.utc)
+        invalidate_work_external_state(db, work.id)
+        _audit(db, "STALE_PROPOSAL_ADOPTED_AS_DRAFT", actor=user, metadata={"work_id": work.id, "source_proposal_id": proposal.id, "stage": proposal.stage})
+        db.commit()
+        return {"adopted_as": "DRAFT", "stage": proposal.stage, "revision": _stage_revision(data, proposal.stage)}
+
     def _review_proposal(
         work_id: str,
         proposal_id: str,
@@ -1067,29 +1177,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         proposal = db.scalar(
             select(ChangeProposal).where(ChangeProposal.id == proposal_id, ChangeProposal.work_id == work.id)
         )
-        if proposal is None or proposal.status != "PENDING":
+        if proposal is None:
+            raise _error("PROPOSAL_NOT_FOUND", "pending change proposal not found", status.HTTP_404_NOT_FOUND)
+        if proposal.status == "STALE" and approved:
+            reason = proposal.stale_reason or "BASE_UNVERIFIED"
+            message = "旧提案依据无法核实，请按当前设定检查并重新提交。" if reason == "LEGACY_DEPENDENCY_UNVERIFIED" else "此提案依据的上游设定已变化，请按当前设定重新提交。"
+            raise _error("PROPOSAL_BASE_CHANGED", f"{reason}: {message}", status.HTTP_409_CONFLICT)
+        if proposal.status != "PENDING":
             raise _error("PROPOSAL_NOT_FOUND", "pending change proposal not found", status.HTTP_404_NOT_FOUND)
         data = _creative_data(work)
+        stale_reason = None
         if proposal.base_revision != _stage_revision(data, proposal.stage):
+            stale_reason = "BASE_CHANGED"
+        elif approved and not proposal_dependencies_current(data, proposal.stage, proposal.dependencies_json):
+            stale_reason = "UPSTREAM_CONFIRMATION_CHANGED"
+        elif approved and (stage_status(data, proposal.stage) != "CONFIRMED" or getattr(data, f"{proposal.stage}_confirmed_json") is None):
+            stale_reason = "BASE_UNVERIFIED"
+        if stale_reason:
             proposal.status = "STALE"
-            proposal.reviewed_by_user_id = owner.id
-            proposal.reviewed_at = datetime.now(timezone.utc)
-            proposal.rejection_reason = "the setting changed after submission"
+            proposal.stale_reason = stale_reason
+            proposal.rejection_reason = None
+            if stale_reason == "BASE_CHANGED":
+                # The owner explicitly inspected this stale proposal while trying to approve it.
+                proposal.reviewed_by_user_id = owner.id
+                proposal.reviewed_at = datetime.now(timezone.utc)
+            else:
+                proposal.reviewed_by_user_id = None
+                proposal.reviewed_at = None
+            db.add(CreativeConfirmationEvent(
+                work_id=work.id,
+                stage=proposal.stage,
+                event_type="PROPOSAL_STALE",
+                content_json=deepcopy(proposal.content_json),
+                source=stale_reason,
+                actor_user_id=None,
+                confirmed_at=None,
+                dependencies_json=deepcopy(proposal.dependencies_json or {}),
+                reason=stale_reason,
+            ))
             _audit(
                 db,
                 "CHANGE_PROPOSAL_STALE",
-                actor=owner,
-                metadata={"work_id": work.id, "proposal_id": proposal.id, "stage": proposal.stage},
+                actor=owner if stale_reason == "BASE_CHANGED" else None,
+                metadata={"work_id": work.id, "proposal_id": proposal.id, "stage": proposal.stage, "reason": stale_reason},
             )
             db.commit()
-            raise _error("PROPOSAL_BASE_CHANGED", "the setting changed after this proposal was submitted; submit it again", status.HTTP_409_CONFLICT)
+            raise _error("PROPOSAL_BASE_CHANGED", f"{stale_reason}: 此提案依据已过时，原内容已保留，请按当前设定重新提交。", status.HTTP_409_CONFLICT)
         proposal.reviewed_by_user_id = owner.id
         proposal.reviewed_at = datetime.now(timezone.utc)
         if approved:
             content = _validate_creative(work.template_version, proposal.stage, proposal.content_json)
-            _set_stage(data, proposal.stage, content, confirmed=True)
+            _set_stage(data, proposal.stage, content)
+            event = record_confirmation(db, work, data, proposal.stage, content, owner, source="APPROVED_PROPOSAL")
             setattr(data, f"{proposal.stage}_revision", _stage_revision(data, proposal.stage) + 1)
             proposal.status = "APPROVED"
+            invalidated = invalidate_downstream(db, work, data, proposal.stage, event, owner)
             work.revision += 1
             invalidate_work_external_state(db, work.id)
             work.updated_at = datetime.now(timezone.utc)
@@ -1097,7 +1239,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             proposal.status = "REJECTED"
             event_type = "CHANGE_PROPOSAL_REJECTED"
-        _audit(db, event_type, actor=owner, metadata={"work_id": work.id, "proposal_id": proposal.id, "stage": proposal.stage})
+        _audit(db, event_type, actor=owner, metadata={"work_id": work.id, "proposal_id": proposal.id, "stage": proposal.stage, "confirmation_event_id": event.id if approved else None, "invalidated_stages": invalidated if approved else []})
+        if approved:
+            for downstream in invalidated:
+                _audit(db, "CREATIVE_STAGE_RECONFIRMATION_REQUIRED", metadata={"work_id": work.id, "stage": downstream, "trigger_event_id": event.id})
         db.commit()
         return _proposal_response(proposal)
 
