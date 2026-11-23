@@ -298,7 +298,20 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
   await page.getByRole("button", { name: "提出设定变更", exact: true }).click();
   await page.getByRole("textbox").first().fill("新的调查主题");
   await page.getByRole("button", { name: "提交变更提案" }).click();
+  // A click completes before the approval transaction; generation must observe
+  // the committed downstream invalidation rather than the old confirmed chain.
+  const approval = page.waitForResponse((response) =>
+    response.request().method() === "POST" &&
+    response.url().includes(`/works/${workId}/change-proposals/`) &&
+    response.url().endsWith("/approve"),
+  );
   await page.getByRole("button", { name: "接受变更", exact: true }).click();
+  expect((await approval).ok()).toBeTruthy();
+  expect((await api(page.request, `/works/${workId}/creative`)).states).toEqual({
+    brief: "CONFIRMED",
+    characters: "NEEDS_RECONFIRMATION",
+    outline: "NEEDS_RECONFIRMATION",
+  });
   const ownerCookies = (await page.request.storageState()).cookies;
   const ownerCsrf = ownerCookies.find((cookie) => cookie.name === "scriptwriting_csrf");
   const blockedGeneration = await page.request.fetch(
