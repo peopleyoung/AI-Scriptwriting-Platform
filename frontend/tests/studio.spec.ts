@@ -146,8 +146,13 @@ test("未保存保护、刷新恢复、设定变更审批、深色与手机", as
   await expect(
     page.getByRole("heading", { name: "待审批的变更提案" }),
   ).toHaveCount(0);
+  const currentBrief = page
+    .getByRole("dialog", { name: "故事设定" })
+    .locator(".creative-field")
+    .filter({ hasText: "核心主题" })
+    .first();
   await expect(
-    page.getByText("关于失去和找回的故事", { exact: true }),
+    currentBrief.getByText("关于失去和找回的故事", { exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "回到写作", exact: true }).click();
   await page.getByRole("button", { name: "切换深色主题" }).click();
