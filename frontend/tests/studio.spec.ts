@@ -216,7 +216,7 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
       username,
       password: "Browser-password-123",
     });
-  await api(request, "/admin/model-configs", "POST", {
+  const browserModel = await api(request, "/admin/model-configs", "POST", {
     display_name: "浏览器测试模型", model_name: "normal-browser", base_url: "http://127.0.0.1:8016/v1", api_key: "browser-test-key",
   });
   await login(page, "browserowner", true);
@@ -306,7 +306,8 @@ test("真实接口：首次登录、创建与确认、外发、发布导出和�
     {
       method: "POST",
       data: {
-        model_config_version_id: "unavailable",
+        // Use a valid model so the request reaches the confirmation-chain guard.
+        model_config_version_id: browserModel.id,
         target_type: "WORK",
         target_path: {},
         idempotency_key: `r4-blocked-${Date.now()}`,
